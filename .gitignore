@@ -1,0 +1,8 @@
+/model/*
+/results/*
+
+*.pt
+*.csv
+*.json
+*.log
+*npy
