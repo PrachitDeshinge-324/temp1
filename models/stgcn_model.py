@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 
 class GraphConvolution(nn.Module):
     def __init__(self, in_channels, out_channels, adjacency_matrix):
@@ -75,7 +76,7 @@ def create_stgcn_model(num_people):
     # Define adjacency matrix based on human skeleton connections
     # This is a simplified example - you'll need to adjust based on your keypoint format
     num_joints = 17  # COCO format has 17 joints
-    adjacency_matrix = nn.eye(num_joints)  # Self-connections
+    adjacency_matrix = np.eye(num_joints)  # Self-connections
     # Add connections between joints (e.g., right shoulder to right elbow)
     # adjacency_matrix[shoulder_idx, elbow_idx] = 1
     

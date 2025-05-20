@@ -79,7 +79,22 @@ class IDMerger:
             plt.axis('off')
             
         plt.tight_layout()
-        plt.show()
+        
+        # Check for Colab environment by looking for common environment variables
+        is_colab = 'COLAB_GPU' in os.environ or 'COLAB_TPU_ADDR' in os.environ
+        
+        if is_colab:
+            # For Colab, we need to make the plot display non-blocking
+            try:
+                plt.show(block=False)
+                # Small pause to ensure the plot is displayed
+                import time
+                time.sleep(0.5)
+            except Exception:
+                plt.show()
+        else:
+            # Normal display for non-Colab environments
+            plt.show()
     
     def merge_ids_interactive(self):
         """Interactive session to merge tracking IDs"""

@@ -23,7 +23,8 @@ class GaitDataset(Dataset):
         return len(self.features)
     
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx]
+        # Make sure features are in the format expected by the model
+        return torch.FloatTensor(self.features[idx]), self.labels[idx]
 
 def prepare_data(npy_file, id_to_name_file, seq_length=30):
     """Prepare data for training from the merged data"""
@@ -66,7 +67,25 @@ def prepare_data(npy_file, id_to_name_file, seq_length=30):
             seq = np.array(rows[i:i+seq_length])
             # Remove track_id and frame_idx columns
             features = seq[:, 2:]
-            sequences.append(features)
+            
+            # Reshape features to match the expected input format for ST-GCN
+            # ST-GCN expects input in format: [N, C, T, V]
+            # N = batch size, C = channels, T = sequence length, V = nodes/joints
+            # Assuming features shape is [seq_length, feature_dim]
+            feature_dim = features.shape[1]
+            
+            # Reshape to create 2 channels by splitting the features
+            # If feature_dim is odd, pad with zeros
+            if feature_dim % 2 != 0:
+                padding = np.zeros((seq_length, 1))
+                features = np.concatenate((features, padding), axis=1)
+                feature_dim += 1
+                
+            half_dim = feature_dim // 2
+            features_reshaped = np.stack([features[:, :half_dim], features[:, half_dim:]], axis=0)  # [2, seq_length, half_dim]
+            features_reshaped = np.transpose(features_reshaped, (0, 1, 2))  # [2, seq_length, half_dim]
+            
+            sequences.append(features_reshaped)
             labels.append(id_to_label[track_id])
     
     return np.array(sequences), np.array(labels), id_to_name, id_to_label
@@ -215,9 +234,9 @@ def main():
     print(f"Train set: {len(X_train)} samples, Test set: {len(X_val)} samples")
     
     # Create data loaders
-    train_dataset = GaitDataset(torch.FloatTensor(X_train), torch.LongTensor(y_train))
-    val_dataset = GaitDataset(torch.FloatTensor(X_val), torch.LongTensor(y_val))
-    
+    train_dataset = GaitDataset(X_train, torch.LongTensor(y_train))
+    val_dataset = GaitDataset(X_val, torch.LongTensor(y_val))
+
     # Adjust batch size for small datasets
     batch_size = min(32, len(X_train) // 2)
     batch_size = max(1, batch_size)  # Ensure batch_size is at least 1
