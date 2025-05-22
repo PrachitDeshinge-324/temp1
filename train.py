@@ -3,268 +3,350 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 import json
 import matplotlib.pyplot as plt
+from datetime import datetime
+import argparse
+from torch.utils.tensorboard import SummaryWriter
 
-# Import models (uncomment the one you want to use)
-from models.stgcn_model import create_stgcn_model
-# from models.tcn_model import GaitTCN
-# from models.cnn_bilstm_model import CNNBiLSTMGaitModel
-# from models.transformer_model import GaitTransformer
+# Import local modules
+from models.lstm_model import GaitLSTM, CNNLSTMGait
+from data_loader import prepare_data_lstm, create_data_loaders
+from utils.train import train_one_epoch, validate, test_model, plot_training_curves
 
-class GaitDataset(Dataset):
-    def __init__(self, features, labels):
-        self.features = features
-        self.labels = labels
+def train_lstm_model(model, train_loader, val_loader, test_loader=None, 
+                     criterion=None, num_epochs=100, lr=0.001, weight_decay=1e-5, 
+                     device='cuda', save_dir='./models/saved',
+                     id_to_name=None, id_to_label=None):
+    """
+    Train LSTM model with advanced techniques to prevent overfitting
     
-    def __len__(self):
-        return len(self.features)
+    Args:
+        model: PyTorch model to train
+        train_loader: DataLoader for training data
+        val_loader: DataLoader for validation data
+        test_loader: DataLoader for test data (optional)
+        criterion: Loss function (if None, CrossEntropyLoss will be used)
+        num_epochs: Maximum number of epochs to train
+        lr: Initial learning rate
+        weight_decay: L2 regularization strength
+        device: Device to train on ('cuda' or 'cpu')
+        save_dir: Directory to save model and results
+        id_to_name: Dictionary mapping IDs to names
+        id_to_label: Dictionary mapping IDs to label indices
+    """
+    # Create directory to save models and results
+    os.makedirs(save_dir, exist_ok=True)
     
-    def __getitem__(self, idx):
-        # Make sure features are in the format expected by the model
-        return torch.FloatTensor(self.features[idx]), self.labels[idx]
-
-def prepare_data(npy_file, id_to_name_file, seq_length=30):
-    """Prepare data for training from the merged data"""
-    # Load data
-    data = np.load(npy_file)
+    # Create TensorBoard writer
+    log_dir = os.path.join(save_dir, 'tensorboard', datetime.now().strftime("%Y%m%d-%H%M%S"))
+    writer = SummaryWriter(log_dir)
     
-    with open(id_to_name_file, 'r') as f:
-        id_to_name = json.load(f)
+    # Default loss function if none provided
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
     
-    # Convert string keys to integers
-    id_to_name = {int(k): v for k, v in id_to_name.items()}
-    
-    # Create mapping from ID to label index
-    unique_ids = sorted(list(id_to_name.keys()))
-    id_to_label = {id_val: i for i, id_val in enumerate(unique_ids)}
-    
-    # Group data by ID and frame
-    sequences = []
-    labels = []
-    
-    # Group by track_id
-    track_groups = {}
-    for row in data:
-        track_id = int(row[0])
-        if track_id not in track_groups:
-            track_groups[track_id] = []
-        track_groups[track_id].append(row)
-    
-    # Create sequences of length seq_length for each track
-    for track_id, rows in track_groups.items():
-        # Only use tracks that have a name
-        if track_id not in id_to_name:
-            continue
-        
-        # Sort by frame index
-        rows.sort(key=lambda x: x[1])
-        
-        # Create sliding window sequences
-        for i in range(0, len(rows) - seq_length + 1, seq_length // 2):  # 50% overlap
-            seq = np.array(rows[i:i+seq_length])
-            # Remove track_id and frame_idx columns
-            features = seq[:, 2:]
-            
-            # Reshape features to match the expected input format for ST-GCN
-            # ST-GCN expects input in format: [N, C, T, V]
-            # N = batch size, C = channels, T = sequence length, V = nodes/joints
-            # Assuming features shape is [seq_length, feature_dim]
-            feature_dim = features.shape[1]
-            
-            # Reshape to create 2 channels by splitting the features
-            # If feature_dim is odd, pad with zeros
-            if feature_dim % 2 != 0:
-                padding = np.zeros((seq_length, 1))
-                features = np.concatenate((features, padding), axis=1)
-                feature_dim += 1
-                
-            half_dim = feature_dim // 2
-            features_reshaped = np.stack([features[:, :half_dim], features[:, half_dim:]], axis=0)  # [2, seq_length, half_dim]
-            features_reshaped = np.transpose(features_reshaped, (0, 1, 2))  # [2, seq_length, half_dim]
-            
-            sequences.append(features_reshaped)
-            labels.append(id_to_label[track_id])
-    
-    return np.array(sequences), np.array(labels), id_to_name, id_to_label
-
-def train_model(model, train_loader, val_loader, num_epochs=50, lr=0.001, device='cuda'):
-    """Train the model"""
     # Move model to device
-    model.to(device)
+    model = model.to(device)
     
-    # Loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
+    # Optimizer with weight decay for regularization
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
-    # Training loop
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-6
+    )
+    
+    # Training loop with early stopping
     train_losses = []
     val_losses = []
-    val_accuracies = []
+    train_accs = []
+    val_accs = []
     
     best_val_acc = 0
+    patience = 15
+    patience_counter = 0
     
     for epoch in range(num_epochs):
-        # Training
-        model.train()
-        train_loss = 0.0
-        
-        for features, labels in train_loader:
-            features, labels = features.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
-            outputs = model(features)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            train_loss += loss.item()
-        
-        train_loss /= len(train_loader)
+        # Train one epoch
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, optimizer, criterion, device, epoch
+        )
         train_losses.append(train_loss)
+        train_accs.append(train_acc)
         
-        # Validation
-        model.eval()
-        val_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for features, labels in val_loader:
-                features, labels = features.to(device), labels.to(device)
-                
-                outputs = model(features)
-                loss = criterion(outputs, labels)
-                val_loss += loss.item()
-                
-                _, predicted = torch.max(outputs, 1)
-                total += labels.size(0)
-                correct += (predicted == labels).sum().item()
-        
-        val_loss /= len(val_loader)
+        # Validate
+        val_loss, val_acc = validate(model, val_loader, criterion, device)
         val_losses.append(val_loss)
+        val_accs.append(val_acc)
         
-        val_acc = 100 * correct / total
-        val_accuracies.append(val_acc)
+        # Log to TensorBoard
+        writer.add_scalar('Loss/train', train_loss, epoch)
+        writer.add_scalar('Loss/val', val_loss, epoch)
+        writer.add_scalar('Accuracy/train', train_acc, epoch)
+        writer.add_scalar('Accuracy/val', val_acc, epoch)
+        writer.add_scalar('LR', optimizer.param_groups[0]['lr'], epoch)
         
         # Update learning rate
         scheduler.step(val_loss)
         
-        print(f'Epoch {epoch+1}/{num_epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%')
+        print(f'Epoch {epoch+1}/{num_epochs} | '
+              f'Train Loss: {train_loss:.4f} | '
+              f'Train Acc: {train_acc:.2f}% | '
+              f'Val Loss: {val_loss:.4f} | '
+              f'Val Acc: {val_acc:.2f}% | '
+              f'LR: {optimizer.param_groups[0]["lr"]:.6f}')
         
         # Save best model
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'val_loss': val_loss,
+            }, os.path.join(save_dir, 'best_model.pth'))
+            print(f'* Model saved at epoch {epoch+1} with validation accuracy {val_acc:.2f}%')
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        # Early stopping
+        if patience_counter >= patience:
+            print(f'Early stopping after {epoch+1} epochs')
+            break
     
     # Plot training curves
-    plt.figure(figsize=(12, 4))
+    plot_training_curves(train_losses, val_losses, train_accs, val_accs, save_dir)
     
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.legend()
+    # Save final model
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_acc': val_acc,
+        'val_loss': val_loss,
+    }, os.path.join(save_dir, 'final_model.pth'))
     
-    plt.subplot(1, 2, 2)
-    plt.plot(val_accuracies, label='Val Accuracy')
-    plt.xlabel('Epoch')
-    plt.ylabel('Accuracy (%)')
-    plt.legend()
+    # Test on test set if provided
+    if test_loader is not None and id_to_name is not None and id_to_label is not None:
+        # Load best model
+        checkpoint = torch.load(os.path.join(save_dir, 'best_model.pth'))
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"Loaded best model from epoch {checkpoint['epoch']+1}")
+        
+        # Test model
+        test_loss, test_acc, report = test_model(model, test_loader, criterion, device, id_to_name, id_to_label, save_dir)
+        print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.2f}%")
+        
+        # Save test results
+        with open(os.path.join(save_dir, 'test_results.txt'), 'w') as f:
+            f.write(f"Test Loss: {test_loss:.4f}\n")
+            f.write(f"Test Accuracy: {test_acc:.2f}%\n\n")
+            f.write("Classification Report:\n")
+            for class_name, metrics in report.items():
+                if class_name in ['accuracy', 'macro avg', 'weighted avg']:
+                    continue
+                f.write(f"{class_name}: Precision={metrics['precision']:.4f}, "
+                        f"Recall={metrics['recall']:.4f}, "
+                        f"F1-Score={metrics['f1-score']:.4f}\n")
     
-    plt.tight_layout()
-    plt.savefig('training_curves.png')
-    plt.show()
+    return model, train_losses, val_losses, train_accs, val_accs
+
+def preprocess_nan_values(data_path):
+    """
+    Preprocess NaN values in the gait data by replacing them with
+    track-specific averages for each feature.
     
-    return model
+    Args:
+        data_path: Path to the numpy data file
+        
+    Returns:
+        Preprocessed numpy array with NaN values replaced
+    """
+    print("Loading raw data...")
+    data = np.load(data_path)
+    
+    print(f"Raw data shape: {data.shape}")
+    print(f"NaN values before preprocessing: {np.isnan(data).sum()}")
+    
+    # The first column contains track IDs
+    track_ids = data[:, 0].astype(int)
+    unique_tracks = np.unique(track_ids)
+    print(f"Found {len(unique_tracks)} unique tracks")
+    
+    # Create a copy of the data to avoid modifying the original
+    preprocessed_data = data.copy()
+    
+    # Process each track separately
+    for track_id in unique_tracks:
+        # Get all rows for this track
+        track_mask = track_ids == track_id
+        track_data = data[track_mask]
+        
+        # Skip processing if there are no NaN values in this track
+        if not np.isnan(track_data).any():
+            continue
+            
+        print(f"Processing track {track_id} with {np.isnan(track_data).sum()} NaN values")
+        
+        # Calculate column means for this track, ignoring NaN values
+        col_means = np.nanmean(track_data, axis=0)
+        
+        # For columns where all values are NaN, use zeros instead
+        col_means = np.nan_to_num(col_means, nan=0.0)
+        
+        # Create a mask for NaN values in this track's data
+        nan_mask = np.isnan(track_data)
+        
+        # Create an array with the same shape as track_data, filled with column means
+        means_array = np.tile(col_means, (track_data.shape[0], 1))
+        
+        # Use the mask to replace only NaN values with corresponding means
+        track_data_filled = np.where(nan_mask, means_array, track_data)
+        
+        # Update the preprocessed data for this track
+        preprocessed_data[track_mask] = track_data_filled
+    
+    # Double-check no NaN values remain
+    remaining_nans = np.isnan(preprocessed_data).sum()
+    if remaining_nans > 0:
+        print(f"Warning: {remaining_nans} NaN values remain after track-based preprocessing")
+        print("Filling remaining NaNs with zeros")
+        preprocessed_data = np.nan_to_num(preprocessed_data, nan=0.0)
+    else:
+        print("Successfully replaced all NaN values with track-specific averages")
+    
+    return preprocessed_data
 
 def main():
+    parser = argparse.ArgumentParser(description='Train LSTM model for gait recognition')
+    parser.add_argument('--data', type=str, default='results1/industrial_gait_features_flat.npy', 
+                        help='Path to numpy data file')
+    parser.add_argument('--id_map', type=str, default='results1/id_to_name.json', 
+                        help='Path to ID to name mapping file')
+    parser.add_argument('--seq_length', type=int, default=30, help='Sequence length')
+    parser.add_argument('--stride', type=int, default=15, help='Stride for sliding window')
+    parser.add_argument('--batch_size', type=int, default=16, help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100, help='Maximum number of epochs')
+    parser.add_argument('--lr', type=float, default=0.001, help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-5, help='Weight decay')
+    parser.add_argument('--model', type=str, default='lstm', choices=['lstm', 'cnnlstm'], 
+                        help='Model type')
+    parser.add_argument('--hidden_size', type=int, default=128, help='Hidden size')
+    parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM layers')
+    parser.add_argument('--dropout', type=float, default=0.3, help='Dropout rate')
+    parser.add_argument('--save_dir', type=str, default='./models/saved', 
+                        help='Directory to save model and results')
+    parser.add_argument('--preprocess', action='store_true', default=True,
+                        help='Preprocess by replacing NaN values with track-specific averages')
+    args = parser.parse_args()
+    
     # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    # Data paths
-    npy_file = 'results/industrial_gait_features_flat.npy'
-    id_to_name_file = 'results/id_to_name.json'
+    # Preprocess data if requested
+    if args.preprocess:
+        print(f"Preprocessing data from {args.data}")
+        preprocessed_data = preprocess_nan_values(args.data)
+        # Save preprocessed data to a temporary file
+        preproc_file = args.data.replace('.npy', '_preprocessed.npy')
+        np.save(preproc_file, preprocessed_data)
+        print(f"Saved preprocessed data to {preproc_file}")
+        # Use preprocessed data for training
+        data_file = preproc_file
+    else:
+        data_file = args.data
     
     # Prepare data
-    sequences, labels, id_to_name, id_to_label = prepare_data(npy_file, id_to_name_file)
+    print(f"Loading and preparing data from {data_file} with sequence length {args.seq_length}")
+    sequences, labels, id_to_name, id_to_label = prepare_data_lstm(
+        npy_file=data_file,
+        id_to_name_file=args.id_map,
+        seq_length=args.seq_length,
+        stride=args.stride
+    )
     
     # Print dataset info
     print(f"Total sequences: {len(sequences)}")
     print(f"Number of classes: {len(id_to_name)}")
     print(f"Classes: {id_to_name}")
+    print(f"Sequence shape: {sequences[0].shape}")
     
     # Calculate class distribution
     unique_labels, counts = np.unique(labels, return_counts=True)
     for label, count in zip(unique_labels, counts):
         person_id = list(id_to_label.keys())[list(id_to_label.values()).index(label)]
         name = id_to_name.get(person_id, "Unknown")
-        print(f"Class {label} ({name}): {count} samples")
-    
-    # For small datasets, ensure a minimum number of test samples
-    min_samples_per_class = min(counts)
-    print(f"Minimum samples for any class: {min_samples_per_class}")
-    
-    # Determine test_size based on dataset size
-    num_classes = len(id_to_name)
-    if len(sequences) < num_classes * 5:  # Very small dataset
-        print("Very small dataset detected. Using leave-one-out strategy.")
-        # Use at least one sample per class for testing
-        test_size = max(0.3, num_classes / len(sequences))
-    else:
-        test_size = 0.2  # Standard 80/20 split
-    
-    print(f"Using test_size={test_size}")
-    
-    try:
-        # Try with stratification
-        X_train, X_val, y_train, y_val = train_test_split(
-            sequences, labels, test_size=test_size, random_state=42, stratify=labels)
-    except ValueError as e:
-        print(f"Stratified split failed: {e}")
-        print("Falling back to non-stratified split")
-        X_train, X_val, y_train, y_val = train_test_split(
-            sequences, labels, test_size=test_size, random_state=42)
-        
-    print(f"Train set: {len(X_train)} samples, Test set: {len(X_val)} samples")
+        print(f"Class {label} ({person_id}, {name}): {count} samples")
     
     # Create data loaders
-    train_dataset = GaitDataset(X_train, torch.LongTensor(y_train))
-    val_dataset = GaitDataset(X_val, torch.LongTensor(y_val))
-
-    # Adjust batch size for small datasets
-    batch_size = min(32, len(X_train) // 2)
-    batch_size = max(1, batch_size)  # Ensure batch_size is at least 1
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    
-    print(f"Using batch size: {batch_size}")
-    
-    # Initialize model (choose one)
-    input_dim = sequences.shape[2]  # Number of features per timestep
-    num_classes = len(id_to_name)
-    
-    # Option 1: ST-GCN (for skeleton data)
-    model = create_stgcn_model(num_classes)
-    
-    # Train the model
-    trained_model = train_model(
-        model, 
-        train_loader, 
-        val_loader, 
-        num_epochs=50,
-        lr=0.001,
-        device=device
+    train_loader, val_loader, test_loader, class_weights = create_data_loaders(
+        sequences=sequences,
+        labels=labels,
+        batch_size=args.batch_size
     )
     
-    print(f"Training complete! Best model saved to 'best_model.pth'")
+    print(f"Train set: {len(train_loader.dataset)} samples")
+    print(f"Validation set: {len(val_loader.dataset)} samples")
+    print(f"Test set: {len(test_loader.dataset)} samples")
+    print(f"Class weights: {class_weights}")
+    
+    # Create model
+    input_size = sequences.shape[2]  # Feature dimension
+    num_classes = len(id_to_name)
+    
+    if args.model == 'lstm':
+        model = GaitLSTM(
+            input_size=input_size,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            num_classes=num_classes,
+            dropout=args.dropout
+        )
+        print(f"Created LSTM model with input_size={input_size}, hidden_size={args.hidden_size}, "
+              f"num_layers={args.num_layers}, num_classes={num_classes}")
+    else:  # cnnlstm
+        model = CNNLSTMGait(
+            input_size=input_size,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            num_classes=num_classes,
+            dropout=args.dropout
+        )
+        print(f"Created CNN-LSTM model with input_size={input_size}, hidden_size={args.hidden_size}, "
+              f"num_layers={args.num_layers}, num_classes={num_classes}")
+    
+    # Create output directory
+    model_save_dir = os.path.join(args.save_dir, args.model, datetime.now().strftime("%Y%m%d-%H%M%S"))
+    os.makedirs(model_save_dir, exist_ok=True)
+    
+    # Create loss function with class weights
+    criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
+    
+    # Train model
+        # Train model
+    model, train_losses, val_losses, train_accs, val_accs = train_lstm_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        criterion=criterion,
+        num_epochs=args.epochs,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        device=device,
+        save_dir=model_save_dir,
+        id_to_name=id_to_name,
+        id_to_label=id_to_label
+    )
+    
+    print(f"Training complete! Best model saved to {model_save_dir}")
     print(f"ID to name mapping: {id_to_name}")
+    print(f"ID to label mapping: {id_to_label}")
 
 if __name__ == "__main__":
     main()

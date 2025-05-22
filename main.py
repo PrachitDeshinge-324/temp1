@@ -66,9 +66,15 @@ def export_all_data(gait_analyzer, args, bbox_info, features_path, bbox_json_pat
     # Gather all unique feature keys across all tracks
     all_feature_keys = set()
     for track_id in gait_analyzer.track_history:
+        # Get both original features and view-invariant features
         features = gait_analyzer.get_features(track_id)
+        invariant_features = gait_analyzer.calculate_view_invariant_features(track_id)
+        
         if features is not None:
             all_feature_keys.update([k for k, v in features.items() 
+                                  if isinstance(v, (int, float, np.floating, np.integer))])
+        if invariant_features is not None:
+            all_feature_keys.update([k for k, v in invariant_features.items() 
                                   if isinstance(v, (int, float, np.floating, np.integer))])
     
     # Sort features for consistency
@@ -81,42 +87,77 @@ def export_all_data(gait_analyzer, args, bbox_info, features_path, bbox_json_pat
     print(f"Saved feature order to {feature_order_path}")
     print(f"Total features in text file: {len(feature_keys)}")
     
+    # First determine the maximum number of keypoints across all tracks
+    # This is needed to create a consistent structure
+    max_keypoints_count = 0
+    for track_id, history in gait_analyzer.track_history.items():
+        for _, kpts in history:
+            max_keypoints_count = max(max_keypoints_count, len(kpts))
+    
+    # Calculate the expected number of coordinates (x,y per keypoint)
+    max_coords = max_keypoints_count * 2
+    print(f"Maximum number of keypoints: {max_keypoints_count} (coordinates: {max_coords})")
+    
     # Prepare data for numpy array
     all_rows = []
     for track_id, history in gait_analyzer.track_history.items():
+        # Get both original and view-invariant features
         features = gait_analyzer.get_features(track_id)
-        # Create feature vector using the same order as in feature_order_path
+        invariant_features = gait_analyzer.calculate_view_invariant_features(track_id)
+        
+        # Create combined feature dictionary
+        combined_features = {}
         if features is not None:
-            feature_vec = np.array([
-                features[k] if (k in features and 
-                               isinstance(features[k], (int, float, np.floating, np.integer))) 
-                else np.nan for k in feature_keys
-            ], dtype=np.float32)
-        else:
-            feature_vec = np.full(len(feature_keys), np.nan, dtype=np.float32)
-            
+            combined_features.update({k: v for k, v in features.items() 
+                                  if isinstance(v, (int, float, np.floating, np.integer))})
+        if invariant_features is not None:
+            combined_features.update({k: v for k, v in invariant_features.items() 
+                                  if isinstance(v, (int, float, np.floating, np.integer))})
+        
+        # Create feature vector using the same order as in feature_order_path
+        feature_vec = np.array([
+            combined_features.get(k, np.nan) for k in feature_keys
+        ], dtype=np.float32)
+        
         for frame_idx, kpts in history:
-            flat_kpts = []
-            for pt in kpts:
-                if isinstance(pt, np.ndarray) and pt.size == 2:
-                    flat_kpts.extend(pt.tolist())
-                else:
-                    flat_kpts.extend([0, 0])
+            # Initialize arrays with NaNs for consistent column positions
+            original_kpt_array = np.full(max_coords, np.nan, dtype=np.float32)
+            normalized_kpt_array = np.full(max_coords, np.nan, dtype=np.float32)
             
-            # Store track_id, frame_idx, keypoints, and features
-            row = [int(track_id), int(frame_idx)] + flat_kpts + feature_vec.tolist()
+            # Fill in available keypoints at their correct positions
+            for i, pt in enumerate(kpts):
+                if isinstance(pt, np.ndarray) and pt.size == 2 and i*2+1 < max_coords:
+                    # Place coordinates at the correct indices
+                    original_kpt_array[i*2] = pt[0]
+                    original_kpt_array[i*2+1] = pt[1]
+            
+            # Get normalized keypoints
+            norm_kpts = gait_analyzer.normalize_keypoints(kpts)
+            if norm_kpts is not None:
+                for i, pt in enumerate(norm_kpts):
+                    if isinstance(pt, np.ndarray) and pt.size == 2 and i*2+1 < max_coords:
+                        normalized_kpt_array[i*2] = pt[0]
+                        normalized_kpt_array[i*2+1] = pt[1]
+            
+            # Combine all parts to create the row
+            # Each row maintains consistent column positions with NaNs for missing data
+            row = [float(track_id), float(frame_idx)] + \
+                  original_kpt_array.tolist() + \
+                  normalized_kpt_array.tolist() + \
+                  feature_vec.tolist()
+            
             all_rows.append(row)
     
+    # Convert to numpy array
     all_rows_np = np.array(all_rows, dtype=np.float32)
     np.save(flat_npy_path, all_rows_np)
     
-    # Calculate how many values are in each row
-    keypoints_count = len(flat_kpts)
-    total_values_per_row = 2 + keypoints_count + len(feature_keys)  # track_id + frame_idx + keypoints + features
+    # Calculate total values per row
+    total_values_per_row = 2 + max_coords*2 + len(feature_keys)
     
-    print(f"Saved flat numpy array with id, frame, keypoints, features to {flat_npy_path}")
-    print(f"Each row contains: 1 track_id + 1 frame_idx + {keypoints_count} keypoint values + {len(feature_keys)} features = {total_values_per_row} total values")
-
+    print(f"Saved flat numpy array with id, frame, keypoints, normalized keypoints, features to {flat_npy_path}")
+    print(f"Each row contains: 1 track_id + 1 frame_idx + {max_coords} keypoint values + {max_coords} normalized keypoint values + {len(feature_keys)} features = {total_values_per_row} total values")
+      
 # New function to handle ID merging
 def merge_ids(args, features_npy_path):
     """

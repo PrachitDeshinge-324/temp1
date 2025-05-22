@@ -1,1171 +1,633 @@
 import numpy as np
-import cv2 as cv
-from collections import defaultdict
-from scipy.signal import find_peaks, savgol_filter
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
+import os
+from collections import defaultdict
 
 class GaitFeatureExtractor:
-    """
-    Extract unique gait features from skeleton keypoints to identify individuals
-    even when wearing the same uniform in industrial settings.
-    Handles multi-directional movement including toward/away from camera.
-    """
-
     def __init__(self):
-        # COCO keypoint indices for reference
-        self.nose = 0
-        self.left_eye, self.right_eye = 1, 2
-        self.left_ear, self.right_ear = 3, 4
-        self.left_shoulder, self.right_shoulder = 5, 6
-        self.left_elbow, self.right_elbow = 7, 8
-        self.left_wrist, self.right_wrist = 9, 10
-        self.left_hip, self.right_hip = 11, 12
-        self.left_knee, self.right_knee = 13, 14
-        self.left_ankle, self.right_ankle = 15, 16
+        # Initialize data structures to track people
+        self.track_history = {}  # Mapping track_id -> [(frame_idx, keypoints), ...]
+        self.features_cache = {}  # Cache for computed features per track_id
+        self.invariant_features_cache = {}  # Cache for view-invariant features
         
-        # Historical data storage for each track
-        self.track_history = defaultdict(list)
-        self.gait_features = defaultdict(dict)
-        self.movement_direction = defaultdict(lambda: "unknown")
-        
-        # Stride analysis settings
-        self.min_frames_for_analysis = 20  # Reduced for quicker analysis
-        self.peak_distance = 8  # Minimum frames between steps
-        
-        # For movement direction calculation
-        self.position_history = defaultdict(list)
-        self.direction_history = defaultdict(list)
-        self.direction_window = 10  # Frames to consider for direction
-
-    def is_valid_keypoint(self, kpt):
-        """Check if a keypoint has valid coordinates"""
-        return (kpt is not None and 
-                isinstance(kpt, np.ndarray) and 
-                kpt.size >= 2 and 
-                kpt[0] > 0 and kpt[1] > 0)
-
     def update_track(self, track_id, keypoints, frame_idx):
-        """Add new keypoint data for a tracked person"""
-        # Skip empty keypoints
-        if keypoints is None or len(keypoints) == 0:
-            return
-            
-        if len(self.track_history[track_id]) > 100:
-            # Keep a moving window to avoid excessive memory usage
-            self.track_history[track_id].pop(0)
-            if len(self.position_history[track_id]) > 0:
-                self.position_history[track_id].pop(0)
+        """Update tracking history for a specific person ID"""
+        if track_id not in self.track_history:
+            self.track_history[track_id] = []
         
-        # Store frame index with keypoints for temporal analysis
-        self.track_history[track_id].append((frame_idx, keypoints.copy()))
+        # Store frame index and keypoints
+        self.track_history[track_id].append((frame_idx, keypoints))
         
-        # Calculate average position (center of mass) and track movement direction
-        valid_points = [kp for kp in keypoints if self.is_valid_keypoint(kp)]
-        if valid_points:
-            avg_position = np.mean(valid_points, axis=0)
-            self.position_history[track_id].append(avg_position)
-            
-            # Determine movement direction if we have enough history
-            if len(self.position_history[track_id]) >= 5:
-                self._update_movement_direction(track_id)
-        
-        # Update viewing direction based on shoulders and hips
-        self._estimate_viewing_direction(track_id, keypoints)
-        
-        # Update features if we have enough frames
-        if len(self.track_history[track_id]) >= self.min_frames_for_analysis:
-            self._extract_all_features(track_id)
+        # Reset features cache for this track as we have new data
+        if track_id in self.features_cache:
+            del self.features_cache[track_id]
+        if track_id in self.invariant_features_cache:
+            del self.invariant_features_cache[track_id]
     
-    def _update_movement_direction(self, track_id):
-        """Calculate the movement direction of the person"""
-        positions = self.position_history[track_id]
-        if len(positions) < 5:
-            return
-            
-        # Get the recent positions and calculate movement vector
-        recent_pos = positions[-5:]
-        start_pos = np.mean(recent_pos[:2], axis=0)  # Average of oldest positions
-        end_pos = np.mean(recent_pos[-2:], axis=0)   # Average of newest positions
-        
-        # Calculate movement vector and distance
-        move_vector = end_pos - start_pos
-        distance = np.linalg.norm(move_vector)
-        
-        # Only update if there's significant movement
-        if distance > 5:  # Minimum pixel movement to consider
-            # Calculate angle of movement
-            angle = np.arctan2(move_vector[1], move_vector[0]) * 180 / np.pi
-            
-            # Classify direction
-            # Note: Camera perspective means y increases downward
-            if abs(move_vector[0]) > abs(move_vector[1] * 2):
-                # Primarily horizontal movement
-                direction = "right" if move_vector[0] > 0 else "left"
-            elif abs(move_vector[1]) > abs(move_vector[0] * 2):
-                # Primarily vertical movement - in camera space this is toward/away
-                direction = "toward" if move_vector[1] > 0 else "away"
-            else:
-                # Diagonal movement
-                if move_vector[0] > 0 and move_vector[1] > 0:
-                    direction = "toward-right"
-                elif move_vector[0] > 0 and move_vector[1] < 0:
-                    direction = "away-right"
-                elif move_vector[0] < 0 and move_vector[1] > 0:
-                    direction = "toward-left"
-                else:
-                    direction = "away-left"
-                    
-            # Store in direction history
-            self.direction_history[track_id].append(direction)
-            if len(self.direction_history[track_id]) > self.direction_window:
-                self.direction_history[track_id].pop(0)
-                
-            # Set the most common recent direction
-            if self.direction_history[track_id]:
-                # Count occurrences of each direction
-                direction_counts = {}
-                for d in self.direction_history[track_id]:
-                    if d not in direction_counts:
-                        direction_counts[d] = 0
-                    direction_counts[d] += 1
-                
-                # Find most common direction
-                self.movement_direction[track_id] = max(
-                    direction_counts.items(), key=lambda x: x[1])[0]
-    
-    def _estimate_viewing_direction(self, track_id, keypoints):
-        """Estimate which way the person is facing"""
-        if len(keypoints) <= max(self.left_hip, self.right_hip):
-            return "unknown"
-            
-        # Check if we can see shoulders and hips
-        shoulders_visible = (self.is_valid_keypoint(keypoints[self.left_shoulder]) and 
-                           self.is_valid_keypoint(keypoints[self.right_shoulder]))
-        hips_visible = (self.is_valid_keypoint(keypoints[self.left_hip]) and 
-                       self.is_valid_keypoint(keypoints[self.right_hip]))
-                
-        if shoulders_visible and hips_visible:
-            # Calculate width of shoulders and hips
-            shoulder_width = np.linalg.norm(
-                keypoints[self.left_shoulder] - keypoints[self.right_shoulder])
-            hip_width = np.linalg.norm(
-                keypoints[self.left_hip] - keypoints[self.right_hip])
-            
-            # Calculate shoulder hip ratio - helps determine if front/back vs side
-            if hip_width > 0:
-                sh_ratio = shoulder_width / hip_width
-                
-                # Store the ratio
-                self.gait_features[track_id]['shoulder_hip_ratio'] = sh_ratio
-                
-                # Use this to guess viewing angle
-                if 0.8 < sh_ratio < 1.2:
-                    view = "front_or_back"  # Front/back typically has similar width
-                else:
-                    view = "side"  # Side view typically has different widths
-                    
-                self.gait_features[track_id]['viewing_angle'] = view
-        
     def get_features(self, track_id):
-        """Get the computed features for a specific track"""
-        if track_id in self.gait_features:
-            return self.gait_features[track_id]
-        return None
-    
-    def get_movement_direction(self, track_id):
-        """Get the current movement direction"""
-        return self.movement_direction.get(track_id, "unknown")
-    
-    def _extract_all_features(self, track_id):
-        """Calculate all gait features for the track"""
+        """Extract gait features from a track's history"""
+        # Return cached features if available
+        if track_id in self.features_cache:
+            return self.features_cache[track_id]
+            
+        if track_id not in self.track_history:
+            return None
+            
         history = self.track_history[track_id]
+        if len(history) < 10:  # Need minimum frames for stable features
+            return None
         
-        # Extract features only if we have enough frames
-        if len(history) < self.min_frames_for_analysis:
-            return
-        
-        # Get all valid keypoints sequences
-        keypoints_seq = []
-        for _, kpts in history:
-            if kpts is not None and len(kpts) > 0:
-                keypoints_seq.append(kpts)
-        
-        # Skip if we don't have any valid keypoints
-        if not keypoints_seq:
-            return
-        
-        # Get movement direction for context
-        movement_dir = self.get_movement_direction(track_id)
-        self.gait_features[track_id]['movement_direction'] = movement_dir
-            
-        # Extract core biomechanical features with direction awareness
-        self._calculate_relative_proportions(track_id, keypoints_seq)
-        self._analyze_walking_pattern(track_id, keypoints_seq)
-        self._calculate_joint_angles(track_id, keypoints_seq)
-        self._analyze_posture(track_id, keypoints_seq)
-        self._extract_gait_cycle_features(track_id, keypoints_seq)
-        self._analyze_center_of_mass(track_id, keypoints_seq)
-        self._analyze_weight_transfer(track_id, keypoints_seq)
-        self._analyze_head_movement(track_id, keypoints_seq)
-        self._analyze_motion_dynamics(track_id, keypoints_seq)
-        self._analyze_movement_periodicity(track_id, keypoints_seq)
-        
-    def _calculate_relative_proportions(self, track_id, keypoints_seq):
-        """Calculate relative body proportions that are scale-invariant"""
+        # Extract features
         features = {}
         
-        # Calculate relative proportions that remain consistent regardless of distance from camera
-        # These are more reliable than absolute pixel measurements
+        # Calculate limb lengths
+        limb_lengths = self._calculate_limb_lengths(track_id)
+        features.update(limb_lengths)
         
-        # Height to width ratio (stays consistent at different distances)
-        height_width_ratios = []
+        # Calculate joint angles
+        joint_angles = self._calculate_joint_angles(track_id)
+        features.update(joint_angles)
         
-        for keypoints in keypoints_seq:
-            # Find the bounding dimensions of the person
-            valid_x = []
-            valid_y = []
-            
-            for i, kp in enumerate(keypoints):
-                if len(keypoints) > i and self.is_valid_keypoint(kp):
-                    valid_x.append(kp[0])
-                    valid_y.append(kp[1])
-            
-            if valid_x and valid_y:
-                height = max(valid_y) - min(valid_y)
-                width = max(valid_x) - min(valid_x)
-                
-                if width > 0:  # Avoid division by zero
-                    height_width_ratios.append(height / width)
+        # Calculate movement features
+        movement_features = self._calculate_movement_features(track_id)
+        features.update(movement_features)
         
-        if height_width_ratios:
-            features['height_width_ratio'] = np.median(height_width_ratios)
-        
-        # Leg to torso ratio (more reliable than absolute heights)
-        leg_torso_ratios = []
-        
-        for keypoints in keypoints_seq:
-            # Try with left side first
-            if (len(keypoints) > self.left_hip and 
-                len(keypoints) > self.left_ankle and 
-                len(keypoints) > self.left_shoulder and 
-                self.is_valid_keypoint(keypoints[self.left_hip]) and 
-                self.is_valid_keypoint(keypoints[self.left_ankle]) and
-                self.is_valid_keypoint(keypoints[self.left_shoulder])):
-                
-                torso_length = np.linalg.norm(keypoints[self.left_shoulder] - keypoints[self.left_hip])
-                leg_length = np.linalg.norm(keypoints[self.left_hip] - keypoints[self.left_ankle])
-                
-                if torso_length > 0:  # Avoid division by zero
-                    leg_torso_ratios.append(leg_length / torso_length)
-            
-            # If left side fails, try right side
-            elif (len(keypoints) > self.right_hip and 
-                  len(keypoints) > self.right_ankle and 
-                  len(keypoints) > self.right_shoulder and 
-                  self.is_valid_keypoint(keypoints[self.right_hip]) and 
-                  self.is_valid_keypoint(keypoints[self.right_ankle]) and
-                  self.is_valid_keypoint(keypoints[self.right_shoulder])):
-                
-                torso_length = np.linalg.norm(keypoints[self.right_shoulder] - keypoints[self.right_hip])
-                leg_length = np.linalg.norm(keypoints[self.right_hip] - keypoints[self.right_ankle])
-                
-                if torso_length > 0:  # Avoid division by zero
-                    leg_torso_ratios.append(leg_length / torso_length)
-        
-        if leg_torso_ratios:
-            features['leg_torso_ratio'] = np.median(leg_torso_ratios)
-        
-        # Upper to lower leg ratio (highly individual)
-        upper_lower_leg_ratios = []
-        
-        for keypoints in keypoints_seq:
-            # Left leg
-            if (len(keypoints) > self.left_hip and 
-                len(keypoints) > self.left_knee and 
-                len(keypoints) > self.left_ankle and 
-                self.is_valid_keypoint(keypoints[self.left_hip]) and 
-                self.is_valid_keypoint(keypoints[self.left_knee]) and
-                self.is_valid_keypoint(keypoints[self.left_ankle])):
-                
-                upper_leg = np.linalg.norm(keypoints[self.left_hip] - keypoints[self.left_knee])
-                lower_leg = np.linalg.norm(keypoints[self.left_knee] - keypoints[self.left_ankle])
-                
-                if lower_leg > 0:  # Avoid division by zero
-                    upper_lower_leg_ratios.append(upper_leg / lower_leg)
-            
-            # Right leg
-            elif (len(keypoints) > self.right_hip and 
-                  len(keypoints) > self.right_knee and 
-                  len(keypoints) > self.right_ankle and 
-                  self.is_valid_keypoint(keypoints[self.right_hip]) and 
-                  self.is_valid_keypoint(keypoints[self.right_knee]) and
-                  self.is_valid_keypoint(keypoints[self.right_ankle])):
-                
-                upper_leg = np.linalg.norm(keypoints[self.right_hip] - keypoints[self.right_knee])
-                lower_leg = np.linalg.norm(keypoints[self.right_knee] - keypoints[self.right_ankle])
-                
-                if lower_leg > 0:  # Avoid division by zero
-                    upper_lower_leg_ratios.append(upper_leg / lower_leg)
-        
-        if upper_lower_leg_ratios:
-            features['upper_lower_leg_ratio'] = np.median(upper_lower_leg_ratios)
-        
-        # Update feature dictionary
-        self.gait_features[track_id].update(features)
-        
-    def _analyze_walking_pattern(self, track_id, keypoints_seq):
-        """Analyze walking patterns including stride length and frequency"""
-        features = {}
-        
-        # Get the movement direction to contextualize pattern analysis
-        movement_dir = self.get_movement_direction(track_id)
-        
-        # Extract ankle positions over time
-        left_ankle_y = [kpts[self.left_ankle][1] 
-                        if len(kpts) > self.left_ankle and self.is_valid_keypoint(kpts[self.left_ankle]) 
-                        else np.nan for kpts in keypoints_seq]
-        right_ankle_y = [kpts[self.right_ankle][1] 
-                         if len(kpts) > self.right_ankle and self.is_valid_keypoint(kpts[self.right_ankle]) 
-                         else np.nan for kpts in keypoints_seq]
-        
-        # Also get X positions for lateral movement analysis
-        left_ankle_x = [kpts[self.left_ankle][0] 
-                        if len(kpts) > self.left_ankle and self.is_valid_keypoint(kpts[self.left_ankle]) 
-                        else np.nan for kpts in keypoints_seq]
-        right_ankle_x = [kpts[self.right_ankle][0] 
-                         if len(kpts) > self.right_ankle and self.is_valid_keypoint(kpts[self.right_ankle]) 
-                         else np.nan for kpts in keypoints_seq]
-        
-        # Clean nan values
-        left_ankle_y = np.array([y for y in left_ankle_y if not np.isnan(y)])
-        right_ankle_y = np.array([y for y in right_ankle_y if not np.isnan(y)])
-        left_ankle_x = np.array([x for x in left_ankle_x if not np.isnan(x)])
-        right_ankle_x = np.array([x for x in right_ankle_x if not np.isnan(x)])
-        
-        # Select which coordinate to use based on movement direction
-        if movement_dir in ["left", "right", "toward-right", "toward-left", "away-right", "away-left"]:
-            # For side movement, x-coordinate shows stride pattern better
-            left_signal = left_ankle_x
-            right_signal = right_ankle_x
-        else:
-            # For toward/away movement, y-coordinate shows stride pattern better
-            left_signal = left_ankle_y
-            right_signal = right_ankle_y
-        
-        # Apply signal processing if we have enough points
-        if len(left_signal) > 10:
-            try:
-                # Smooth the signal first to reduce noise
-                left_signal_smooth = savgol_filter(left_signal, min(9, len(left_signal) - (len(left_signal) % 2 - 1)), 3)
-                # Find peaks (steps) in ankle movement
-                left_peaks, _ = find_peaks(left_signal_smooth, distance=self.peak_distance)
-                if len(left_peaks) >= 2:
-                    features['left_stride_frequency'] = len(left_peaks) / len(left_signal)
-                    # Calculate stride length variation (consistency of steps)
-                    if len(left_peaks) >= 3:
-                        stride_lengths = np.diff(left_peaks)
-                        features['left_stride_consistency'] = 1.0 - (np.std(stride_lengths) / np.mean(stride_lengths))
-            except Exception:
-                pass
-                
-        if len(right_signal) > 10:
-            try:
-                # Smooth the signal
-                right_signal_smooth = savgol_filter(right_signal, min(9, len(right_signal) - (len(right_signal) % 2 - 1)), 3)
-                # Find peaks
-                right_peaks, _ = find_peaks(right_signal_smooth, distance=self.peak_distance)
-                if len(right_peaks) >= 2:
-                    features['right_stride_frequency'] = len(right_peaks) / len(right_signal)
-                    if len(right_peaks) >= 3:
-                        stride_lengths = np.diff(right_peaks)
-                        features['right_stride_consistency'] = 1.0 - (np.std(stride_lengths) / np.mean(stride_lengths))
-            except Exception:
-                pass
-                
-        # Calculate arm swing characteristics - normalized to body size
-        arm_swing_features = self._calculate_arm_swing_features(keypoints_seq)
-        features.update(arm_swing_features)
-            
-        # Update feature dictionary
-        self.gait_features[track_id].update(features)
+        # Cache computed features
+        self.features_cache[track_id] = features
+        return features
     
-    def _calculate_arm_swing_features(self, keypoints_seq):
-        """Calculate normalized arm swing patterns"""
+    def _calculate_limb_lengths(self, track_id):
+        """Calculate limb length features"""
         features = {}
+        history = self.track_history[track_id]
+        keypoints_list = [kpts for _, kpts in history]
         
-        # Extract wrist positions relative to hip positions
-        left_wrist_rel = []
-        right_wrist_rel = []
+        # Define limb connections (adjust indices based on your keypoint format)
+        limbs = {
+            "neck_to_right_shoulder": (1, 2),
+            "neck_to_left_shoulder": (1, 5),
+            "right_shoulder_to_right_elbow": (2, 3),
+            "right_elbow_to_right_wrist": (3, 4),
+            "left_shoulder_to_left_elbow": (5, 6),
+            "left_elbow_to_left_wrist": (6, 7),
+            "right_hip_to_right_knee": (8, 9),
+            "right_knee_to_right_ankle": (9, 10),
+            "left_hip_to_left_knee": (11, 12),
+            "left_knee_to_left_ankle": (12, 13)
+        }
         
-        for keypoints in keypoints_seq:
-            # Left arm relative to hip
-            if (len(keypoints) > self.left_wrist and 
-                len(keypoints) > self.left_hip and 
-                self.is_valid_keypoint(keypoints[self.left_wrist]) and 
-                self.is_valid_keypoint(keypoints[self.left_hip])):
-                
-                rel_pos = keypoints[self.left_wrist] - keypoints[self.left_hip]
-                left_wrist_rel.append(rel_pos)
+        # Calculate average length for each limb
+        for limb_name, (idx1, idx2) in limbs.items():
+            lengths = []
+            for kpts in keypoints_list:
+                if len(kpts) > max(idx1, idx2):
+                    p1, p2 = kpts[idx1], kpts[idx2]
+                    if not (np.isnan(p1).any() or np.isnan(p2).any()):
+                        length = np.linalg.norm(p1 - p2)
+                        lengths.append(length)
             
-            # Right arm relative to hip
-            if (len(keypoints) > self.right_wrist and 
-                len(keypoints) > self.right_hip and 
-                self.is_valid_keypoint(keypoints[self.right_wrist]) and 
-                self.is_valid_keypoint(keypoints[self.right_hip])):
-                
-                rel_pos = keypoints[self.right_wrist] - keypoints[self.right_hip]
-                right_wrist_rel.append(rel_pos)
-        
-        # Calculate swing characteristics
-        if len(left_wrist_rel) > 5:
-            left_wrist_rel = np.array(left_wrist_rel)
-            features['left_arm_swing_x'] = np.std(left_wrist_rel[:, 0])
-            features['left_arm_swing_y'] = np.std(left_wrist_rel[:, 1])
-            
-            # Calculate arm swing area (approximation of swing volume)
-            features['left_arm_swing_area'] = features['left_arm_swing_x'] * features['left_arm_swing_y']
-        
-        if len(right_wrist_rel) > 5:
-            right_wrist_rel = np.array(right_wrist_rel)
-            features['right_arm_swing_x'] = np.std(right_wrist_rel[:, 0])
-            features['right_arm_swing_y'] = np.std(right_wrist_rel[:, 1])
-            
-            # Calculate arm swing area
-            features['right_arm_swing_area'] = features['right_arm_swing_x'] * features['right_arm_swing_y']
-        
-        # Calculate arm swing symmetry if both arms are visible
-        if ('left_arm_swing_area' in features and 'right_arm_swing_area' in features and
-            features['left_arm_swing_area'] > 0 and features['right_arm_swing_area'] > 0):
-            
-            # Ratio closer to 1.0 means more symmetric arm swing
-            swing_ratio = min(features['left_arm_swing_area'], features['right_arm_swing_area']) / \
-                          max(features['left_arm_swing_area'], features['right_arm_swing_area'])
-            features['arm_swing_symmetry'] = swing_ratio
+            if lengths:
+                features[f"avg_{limb_name}_length"] = np.mean(lengths)
+                features[f"std_{limb_name}_length"] = np.std(lengths)
         
         return features
-
-    def _calculate_joint_angles(self, track_id, keypoints_seq):
-        """Calculate characteristic joint angles during movement"""
-        features = {}
-        
-        # Elbow angles over time (characteristic of individual movement)
-        left_elbow_angles = []
-        right_elbow_angles = []
-        
-        # Knee angles over time
-        left_knee_angles = []
-        right_knee_angles = []
-        
-        for keypoints in keypoints_seq:
-            # Left elbow angle
-            if (len(keypoints) > self.left_shoulder and
-                len(keypoints) > self.left_elbow and
-                len(keypoints) > self.left_wrist and
-                self.is_valid_keypoint(keypoints[self.left_shoulder]) and
-                self.is_valid_keypoint(keypoints[self.left_elbow]) and
-                self.is_valid_keypoint(keypoints[self.left_wrist])):
-                
-                angle = self._calculate_angle(
-                    keypoints[self.left_shoulder],
-                    keypoints[self.left_elbow],
-                    keypoints[self.left_wrist]
-                )
-                left_elbow_angles.append(angle)
-            
-            # Right elbow angle
-            if (len(keypoints) > self.right_shoulder and
-                len(keypoints) > self.right_elbow and
-                len(keypoints) > self.right_wrist and
-                self.is_valid_keypoint(keypoints[self.right_shoulder]) and
-                self.is_valid_keypoint(keypoints[self.right_elbow]) and
-                self.is_valid_keypoint(keypoints[self.right_wrist])):
-                
-                angle = self._calculate_angle(
-                    keypoints[self.right_shoulder],
-                    keypoints[self.right_elbow],
-                    keypoints[self.right_wrist]
-                )
-                right_elbow_angles.append(angle)
-                
-            # Left knee angle
-            if (len(keypoints) > self.left_hip and
-                len(keypoints) > self.left_knee and
-                len(keypoints) > self.left_ankle and
-                self.is_valid_keypoint(keypoints[self.left_hip]) and
-                self.is_valid_keypoint(keypoints[self.left_knee]) and
-                self.is_valid_keypoint(keypoints[self.left_ankle])):
-                
-                angle = self._calculate_angle(
-                    keypoints[self.left_hip],
-                    keypoints[self.left_knee],
-                    keypoints[self.left_ankle]
-                )
-                left_knee_angles.append(angle)
-            
-            # Right knee angle
-            if (len(keypoints) > self.right_hip and
-                len(keypoints) > self.right_knee and
-                len(keypoints) > self.right_ankle and
-                self.is_valid_keypoint(keypoints[self.right_hip]) and
-                self.is_valid_keypoint(keypoints[self.right_knee]) and
-                self.is_valid_keypoint(keypoints[self.right_ankle])):
-                
-                angle = self._calculate_angle(
-                    keypoints[self.right_hip],
-                    keypoints[self.right_knee],
-                    keypoints[self.right_ankle]
-                )
-                right_knee_angles.append(angle)
-        
-        # Store statistical features of joint angles
-        if left_elbow_angles:
-            features['left_elbow_angle_mean'] = np.mean(left_elbow_angles)
-            features['left_elbow_angle_std'] = np.std(left_elbow_angles)
-            features['left_elbow_angle_range'] = max(left_elbow_angles) - min(left_elbow_angles)
-            
-        if right_elbow_angles:
-            features['right_elbow_angle_mean'] = np.mean(right_elbow_angles)
-            features['right_elbow_angle_std'] = np.std(right_elbow_angles)
-            features['right_elbow_angle_range'] = max(right_elbow_angles) - min(right_elbow_angles)
-            
-        if left_knee_angles:
-            features['left_knee_angle_mean'] = np.mean(left_knee_angles)
-            features['left_knee_angle_std'] = np.std(left_knee_angles)
-            features['left_knee_angle_range'] = max(left_knee_angles) - min(left_knee_angles)
-            
-        if right_knee_angles:
-            features['right_knee_angle_mean'] = np.mean(right_knee_angles)
-            features['right_knee_angle_std'] = np.std(right_knee_angles)
-            features['right_knee_angle_range'] = max(right_knee_angles) - min(right_knee_angles)
-            
-        # Calculate angle symmetry between left and right sides
-        if left_elbow_angles and right_elbow_angles:
-            features['elbow_angle_symmetry'] = 1.0 - abs(
-                features['left_elbow_angle_mean'] - features['right_elbow_angle_mean']) / 180.0
-                
-        if left_knee_angles and right_knee_angles:
-            features['knee_angle_symmetry'] = 1.0 - abs(
-                features['left_knee_angle_mean'] - features['right_knee_angle_mean']) / 180.0
-            
-        # Update feature dictionary
-        self.gait_features[track_id].update(features)
     
-    def _analyze_posture(self, track_id, keypoints_seq):
-        """Analyze posture characteristics"""
+    def _calculate_joint_angles(self, track_id):
+        """Calculate joint angle features"""
         features = {}
+        history = self.track_history[track_id]
+        keypoints_list = [kpts for _, kpts in history]
         
-        # Calculate spine angles (hip to shoulder)
-        spine_angles = []
+        # Define joint angles (triplets of keypoint indices)
+        joints = {
+            "right_elbow": (2, 3, 4),  # shoulder, elbow, wrist
+            "left_elbow": (5, 6, 7),
+            "right_knee": (8, 9, 10),  # hip, knee, ankle
+            "left_knee": (11, 12, 13)
+        }
         
-        for keypoints in keypoints_seq:
-            # Get midpoints of shoulders and hips
-            if (len(keypoints) > self.left_shoulder and
-                len(keypoints) > self.right_shoulder and
-                len(keypoints) > self.left_hip and
-                len(keypoints) > self.right_hip and
-                self.is_valid_keypoint(keypoints[self.left_shoulder]) and
-                self.is_valid_keypoint(keypoints[self.right_shoulder]) and
-                self.is_valid_keypoint(keypoints[self.left_hip]) and
-                self.is_valid_keypoint(keypoints[self.right_hip])):
-                
-                mid_shoulder = (keypoints[self.left_shoulder] + keypoints[self.right_shoulder]) / 2
-                mid_hip = (keypoints[self.left_hip] + keypoints[self.right_hip]) / 2
-                
-                # Calculate angle from vertical
-                spine_vector = mid_shoulder - mid_hip
-                vertical_vector = np.array([0, -1])  # Pointing up
-                
-                cos_angle = np.dot(spine_vector, vertical_vector) / (
-                    np.linalg.norm(spine_vector) * np.linalg.norm(vertical_vector))
-                angle = np.arccos(np.clip(cos_angle, -1.0, 1.0)) * 180 / np.pi
-                
-                spine_angles.append(angle)
+        # Calculate average angle for each joint
+        for joint_name, (idx1, idx2, idx3) in joints.items():
+            angles = []
+            for kpts in keypoints_list:
+                if len(kpts) > max(idx1, idx2, idx3):
+                    p1, p2, p3 = kpts[idx1], kpts[idx2], kpts[idx3]
+                    if not (np.isnan(p1).any() or np.isnan(p2).any() or np.isnan(p3).any()):
+                        angle = self._calculate_angle(p1, p2, p3)
+                        if angle is not None:
+                            angles.append(angle)
+            
+            if angles:
+                features[f"avg_{joint_name}_angle"] = np.mean(angles)
+                features[f"std_{joint_name}_angle"] = np.std(angles)
         
-        if spine_angles:
-            features['spine_angle_mean'] = np.mean(spine_angles)
-            features['spine_angle_std'] = np.std(spine_angles)
-        
-        # Update feature dictionary
-        self.gait_features[track_id].update(features)
+        return features
     
-    def _extract_gait_cycle_features(self, track_id, keypoints_seq):
-        """Extract timing features of the gait cycle"""
+    def _calculate_movement_features(self, track_id):
+        """Calculate movement-based features"""
         features = {}
+        history = self.track_history[track_id]
+        frames, keypoints_list = zip(*history)
         
-        # Track foot positions over time
-        left_foot_y = []
-        right_foot_y = []
-        frames = []
+        # Calculate step frequency and rhythm using ankle keypoints
+        ankle_positions = []
+        valid_frames = []
         
-        for i, keypoints in enumerate(keypoints_seq):
-            left_ankle_valid = (len(keypoints) > self.left_ankle and 
-                               self.is_valid_keypoint(keypoints[self.left_ankle]))
-            right_ankle_valid = (len(keypoints) > self.right_ankle and 
-                                self.is_valid_keypoint(keypoints[self.right_ankle]))
-                
-            if left_ankle_valid:
-                left_foot_y.append(keypoints[self.left_ankle][1])
-                frames.append(i)
-                
-            if right_ankle_valid:
-                right_foot_y.append(keypoints[self.right_ankle][1])
+        for frame_idx, kpts in zip(frames, keypoints_list):
+            if len(kpts) > 13:  # Check if ankles exist (adjust index as needed)
+                left_ankle = kpts[13]
+                right_ankle = kpts[10]
+                if not (np.isnan(left_ankle).any() or np.isnan(right_ankle).any()):
+                    ankle_positions.append((left_ankle, right_ankle))
+                    valid_frames.append(frame_idx)
         
-        # Need enough frames for analysis
-        if len(left_foot_y) > self.min_frames_for_analysis and len(right_foot_y) > self.min_frames_for_analysis:
-            try:
-                # Smooth signals
-                left_smooth = savgol_filter(left_foot_y, min(9, len(left_foot_y) - (len(left_foot_y) % 2 - 1)), 3)
-                right_smooth = savgol_filter(right_foot_y, min(9, len(right_foot_y) - (len(right_foot_y) % 2 - 1)), 3)
+        if len(ankle_positions) > 10:  # Need enough samples for meaningful analysis
+            # Calculate stride metrics
+            left_strides = []
+            right_strides = []
+            stride_times = []
+            
+            for i in range(1, len(ankle_positions)):
+                prev_left, prev_right = ankle_positions[i-1]
+                curr_left, curr_right = ankle_positions[i]
+                time_diff = valid_frames[i] - valid_frames[i-1]
                 
-                # Find peaks for heel strike detection
-                left_peaks, _ = find_peaks(left_smooth, distance=self.peak_distance)
-                right_peaks, _ = find_peaks(right_smooth, distance=self.peak_distance)
+                # Distance between current and previous positions
+                left_dist = np.linalg.norm(curr_left - prev_left)
+                right_dist = np.linalg.norm(curr_right - prev_right)
                 
-                if len(left_peaks) > 1 and len(right_peaks) > 1:
-                    # Calculate stride time (time between consecutive heel strikes)
-                    left_stride_times = np.diff(left_peaks)
-                    right_stride_times = np.diff(right_peaks)
-                    
-                    # Store stride time statistics if available
-                    if len(left_stride_times) > 0:
-                        features['left_stride_time_mean'] = np.mean(left_stride_times)
-                        features['left_stride_time_std'] = np.std(left_stride_times)
-                        
-                    if len(right_stride_times) > 0:
-                        features['right_stride_time_mean'] = np.mean(right_stride_times)
-                        features['right_stride_time_std'] = np.std(right_stride_times)
-                    
-                    # Calculate phase difference between feet (normalized to stride cycle)
-                    if len(left_peaks) > 0 and len(right_peaks) > 0:
-                        # Find the closest peaks to calculate phase difference
-                        min_dist = float('inf')
-                        phase_diff = 0.0
-                        
-                        for lp in left_peaks:
-                            for rp in right_peaks:
-                                dist = abs(lp - rp)
-                                if dist < min_dist:
-                                    min_dist = dist
-                                    # Calculate as a fraction of stride cycle
-                                    if 'left_stride_time_mean' in features and features['left_stride_time_mean'] > 0:
-                                        phase_diff = dist / features['left_stride_time_mean']
-                        
-                        features['step_phase_difference'] = min(phase_diff, 1.0 - phase_diff)
-            except Exception:
-                pass
+                # Only count significant movements as strides
+                if left_dist > 5:  # Threshold for stride detection (adjust as needed)
+                    left_strides.append(left_dist)
+                    stride_times.append(time_diff)
+                if right_dist > 5:
+                    right_strides.append(right_dist)
+                    stride_times.append(time_diff)
+            
+            if left_strides and right_strides and stride_times:
+                # Basic stride metrics
+                features['mean_left_stride_length'] = np.mean(left_strides)
+                features['mean_right_stride_length'] = np.mean(right_strides)
+                features['std_left_stride_length'] = np.std(left_strides)
+                features['std_right_stride_length'] = np.std(right_strides)
                 
-        # Update feature dictionary
-        self.gait_features[track_id].update(features)
+                # Gait symmetry (ratio of left to right stride)
+                features['gait_symmetry'] = np.mean(left_strides) / np.mean(right_strides)
+                
+                # Average stride speed
+                features['mean_stride_speed'] = (np.mean(left_strides) + np.mean(right_strides)) / (2 * np.mean(stride_times))
+                
+        return features
     
-    def _analyze_center_of_mass(self, track_id, keypoints_seq):
-        """Analyze center of mass movement patterns"""
+    def normalize_keypoints(self, keypoints):
+        """
+        Normalize keypoints to make them invariant to camera view and distance.
+        
+        Approaches:
+        1. Body-centered coordinate system (origin at mid-hip)
+        2. Scale normalization based on torso length
+        3. Rotation normalization based on shoulder orientation
+        """
+        if keypoints is None or len(keypoints) < 15:  # Ensure we have enough keypoints
+            return None
+            
+        normalized_kpts = keypoints.copy()
+        
+        # 1. Translate to body-centered coordinate system
+        # Use mid-hip point as origin (keypoint indices depend on your skeleton format)
+        # Assuming mid-hip can be calculated from left hip (11) and right hip (8)
+        left_hip_idx, right_hip_idx = 11, 8  # Adjust based on your keypoint format
+        if (left_hip_idx < len(keypoints) and right_hip_idx < len(keypoints) and 
+                not np.isnan(keypoints[left_hip_idx]).any() and 
+                not np.isnan(keypoints[right_hip_idx]).any()):
+            mid_hip = (keypoints[left_hip_idx] + keypoints[right_hip_idx]) / 2
+            for i in range(len(normalized_kpts)):
+                if not np.isnan(normalized_kpts[i]).any():
+                    normalized_kpts[i] = normalized_kpts[i] - mid_hip
+        else:
+            # If hip points aren't available, try other reference points
+            # For example, use keypoint with index 1 (often neck/nose)
+            if 1 < len(keypoints) and not np.isnan(keypoints[1]).any():
+                reference_point = keypoints[1]
+                for i in range(len(normalized_kpts)):
+                    if not np.isnan(normalized_kpts[i]).any():
+                        normalized_kpts[i] = normalized_kpts[i] - reference_point
+            else:
+                return None  # Can't normalize without reference point
+        
+        # 2. Scale normalization
+        # Use distance between neck and mid-hip as reference scale
+        neck_idx = 1  # Adjust based on your skeleton format
+        if (neck_idx < len(keypoints) and left_hip_idx < len(keypoints) and 
+                right_hip_idx < len(keypoints)):
+            if (not np.isnan(keypoints[neck_idx]).any() and 
+                    not np.isnan(keypoints[left_hip_idx]).any() and 
+                    not np.isnan(keypoints[right_hip_idx]).any()):
+                mid_hip = (keypoints[left_hip_idx] + keypoints[right_hip_idx]) / 2
+                torso_length = np.linalg.norm(keypoints[neck_idx] - mid_hip)
+                if torso_length > 0:
+                    for i in range(len(normalized_kpts)):
+                        if not np.isnan(normalized_kpts[i]).any():
+                            normalized_kpts[i] = normalized_kpts[i] / torso_length
+        
+        # 3. Rotation normalization (align shoulders to be horizontal)
+        left_shoulder_idx, right_shoulder_idx = 5, 2  # Adjust based on your keypoint format
+        if (left_shoulder_idx < len(keypoints) and right_shoulder_idx < len(keypoints) and
+                not np.isnan(keypoints[left_shoulder_idx]).any() and 
+                not np.isnan(keypoints[right_shoulder_idx]).any()):
+            # Vector between shoulders
+            shoulder_vector = keypoints[right_shoulder_idx] - keypoints[left_shoulder_idx]
+            
+            # Calculate rotation angle to make shoulders horizontal
+            angle = np.arctan2(shoulder_vector[1], shoulder_vector[0])
+            
+            # Create rotation matrix
+            cos_angle, sin_angle = np.cos(-angle), np.sin(-angle)
+            rotation_matrix = np.array([
+                [cos_angle, -sin_angle],
+                [sin_angle, cos_angle]
+            ])
+            
+            # Apply rotation to all keypoints
+            for i in range(len(normalized_kpts)):
+                if not np.isnan(normalized_kpts[i]).any():
+                    normalized_kpts[i] = rotation_matrix @ normalized_kpts[i]
+        
+        return normalized_kpts
+
+    def calculate_view_invariant_features(self, track_id):
+        """
+        Calculate features that are invariant to camera view.
+        """
+        # Return cached features if available
+        if track_id in self.invariant_features_cache:
+            return self.invariant_features_cache[track_id]
+            
+        if track_id not in self.track_history:
+            return None
+        
         features = {}
+        history = self.track_history[track_id]
         
-        # Track center of mass positions over time
-        com_positions = []
+        if len(history) < 10:  # Require minimum frames for stable features
+            return None
         
-        for keypoints in keypoints_seq:
-            # Get all valid keypoints
-            valid_keypoints = []
-            for i in range(len(keypoints)):
-                if len(keypoints) > i and self.is_valid_keypoint(keypoints[i]):
-                    valid_keypoints.append(keypoints[i])
+        # Extract normalized keypoints
+        keypoints_list = [kpts for _, kpts in history]
+        normalized_kpts_list = [self.normalize_keypoints(kpts) for kpts in keypoints_list]
+        
+        # Skip if normalization failed
+        if any(x is None for x in normalized_kpts_list) or len(normalized_kpts_list) == 0:
+            return None
+        
+        # 1. Joint angles (invariant to translation and scale)
+        angles_left_arm = []
+        angles_right_arm = []
+        angles_left_leg = []
+        angles_right_leg = []
+        
+        for n_kpts in normalized_kpts_list:
+            # Left arm angle (shoulder-elbow-wrist)
+            if 5 < len(n_kpts) and 6 < len(n_kpts) and 7 < len(n_kpts):
+                left_shoulder = n_kpts[5]
+                left_elbow = n_kpts[6]
+                left_wrist = n_kpts[7]
+                if not (np.isnan(left_shoulder).any() or np.isnan(left_elbow).any() or np.isnan(left_wrist).any()):
+                    angle = self._calculate_angle(left_shoulder, left_elbow, left_wrist)
+                    if angle is not None:
+                        angles_left_arm.append(angle)
+                
+            # Right arm angle (shoulder-elbow-wrist)
+            if 2 < len(n_kpts) and 3 < len(n_kpts) and 4 < len(n_kpts):
+                right_shoulder = n_kpts[2]
+                right_elbow = n_kpts[3]
+                right_wrist = n_kpts[4]
+                if not (np.isnan(right_shoulder).any() or np.isnan(right_elbow).any() or np.isnan(right_wrist).any()):
+                    angle = self._calculate_angle(right_shoulder, right_elbow, right_wrist)
+                    if angle is not None:
+                        angles_right_arm.append(angle)
                     
-            if valid_keypoints:
-                # Calculate center of mass
-                com = np.mean(valid_keypoints, axis=0)
-                com_positions.append(com)
+            # Left leg angle (hip-knee-ankle)
+            if 11 < len(n_kpts) and 12 < len(n_kpts) and 13 < len(n_kpts):
+                left_hip = n_kpts[11]
+                left_knee = n_kpts[12]
+                left_ankle = n_kpts[13]
+                if not (np.isnan(left_hip).any() or np.isnan(left_knee).any() or np.isnan(left_ankle).any()):
+                    angle = self._calculate_angle(left_hip, left_knee, left_ankle)
+                    if angle is not None:
+                        angles_left_leg.append(angle)
+                    
+            # Right leg angle (hip-knee-ankle)
+            if 8 < len(n_kpts) and 9 < len(n_kpts) and 10 < len(n_kpts):
+                right_hip = n_kpts[8]
+                right_knee = n_kpts[9]
+                right_ankle = n_kpts[10]
+                if not (np.isnan(right_hip).any() or np.isnan(right_knee).any() or np.isnan(right_ankle).any()):
+                    angle = self._calculate_angle(right_hip, right_knee, right_ankle)
+                    if angle is not None:
+                        angles_right_leg.append(angle)
         
-        if len(com_positions) >= 10:
-            com_positions = np.array(com_positions)
+        # Calculate statistics for joint angles
+        if angles_left_arm:
+            features['inv_left_arm_angle_mean'] = np.mean(angles_left_arm)
+            features['inv_left_arm_angle_std'] = np.std(angles_left_arm)
             
-            # Calculate vertical oscillation (distinctive walking characteristic)
-            y_positions = com_positions[:, 1]
-            features['com_vertical_oscillation'] = np.std(y_positions)
+        if angles_right_arm:
+            features['inv_right_arm_angle_mean'] = np.mean(angles_right_arm)
+            features['inv_right_arm_angle_std'] = np.std(angles_right_arm)
             
-            # Calculate lateral stability (how much side-to-side movement)
-            x_positions = com_positions[:, 0]
-            features['com_lateral_stability'] = np.std(x_positions)
+        if angles_left_leg:
+            features['inv_left_leg_angle_mean'] = np.mean(angles_left_leg)
+            features['inv_left_leg_angle_std'] = np.std(angles_left_leg)
             
-            # Calculate path smoothness using velocity changes
-            if len(com_positions) > 1:
-                velocities = np.diff(com_positions, axis=0)
-                acc = np.diff(velocities, axis=0)
-                features['path_smoothness'] = 1.0 / (1.0 + np.mean(np.linalg.norm(acc, axis=1)))
+        if angles_right_leg:
+            features['inv_right_leg_angle_mean'] = np.mean(angles_right_leg)
+            features['inv_right_leg_angle_std'] = np.std(angles_right_leg)
         
-        self.gait_features[track_id].update(features)
-
-    def _analyze_weight_transfer(self, track_id, keypoints_seq):
-        """Analyze how weight transfers between feet"""
+        # 2. Limb length ratios (invariant to scale)
+        limb_ratios = self._calculate_limb_ratios(normalized_kpts_list)
+        features.update(limb_ratios)
+        
+        # 3. Temporal features - gait cycle analysis
+        temporal_features = self._calculate_temporal_features(normalized_kpts_list)
+        features.update(temporal_features)
+        
+        # 4. Postural features
+        postural_features = self._calculate_postural_features(normalized_kpts_list)
+        features.update(postural_features)
+        
+        # Cache and return features
+        self.invariant_features_cache[track_id] = features
+        return features
+    
+    def _calculate_limb_ratios(self, normalized_kpts_list):
+        """Calculate limb length ratios that are invariant to scale"""
         features = {}
         
-        # Track hip position relative to ankles
-        hip_to_ankle_distances = []
+        # Define limbs to measure
+        limbs = {
+            'torso': (1, 8),  # neck to hip
+            'upper_arm_right': (2, 3),  # shoulder to elbow
+            'lower_arm_right': (3, 4),  # elbow to wrist
+            'upper_arm_left': (5, 6),
+            'lower_arm_left': (6, 7),
+            'upper_leg_right': (8, 9),  # hip to knee
+            'lower_leg_right': (9, 10),  # knee to ankle
+            'upper_leg_left': (11, 12),
+            'lower_leg_left': (12, 13)
+        }
         
-        for keypoints in keypoints_seq:
-            if (len(keypoints) > self.left_hip and 
-                len(keypoints) > self.right_hip and
-                len(keypoints) > self.left_ankle and
-                len(keypoints) > self.right_ankle and
-                self.is_valid_keypoint(keypoints[self.left_hip]) and
-                self.is_valid_keypoint(keypoints[self.right_hip]) and
-                self.is_valid_keypoint(keypoints[self.left_ankle]) and
-                self.is_valid_keypoint(keypoints[self.right_ankle])):
-                
-                # Calculate mid-hip position
-                mid_hip = (keypoints[self.left_hip] + keypoints[self.right_hip]) / 2
-                
-                # Calculate distances from mid-hip to each ankle (proxy for weight distribution)
-                left_dist = np.linalg.norm(mid_hip - keypoints[self.left_ankle])
-                right_dist = np.linalg.norm(mid_hip - keypoints[self.right_ankle])
-                
-                # Calculate left-right ratio (value close to 1 means even weight distribution)
-                if min(left_dist, right_dist) > 0:
-                    ratio = min(left_dist, right_dist) / max(left_dist, right_dist)
-                    hip_to_ankle_distances.append(ratio)
+        # Calculate average lengths
+        avg_lengths = defaultdict(list)
         
-        if hip_to_ankle_distances:
-            # Weight transfer stability - lower std means more consistent weight transfer
-            features['weight_transfer_stability'] = 1.0 - np.std(hip_to_ankle_distances)
-            # Weight distribution symmetry - higher value means more symmetric weight distribution
-            features['weight_distribution_symmetry'] = np.mean(hip_to_ankle_distances)
+        for n_kpts in normalized_kpts_list:
+            for limb_name, (idx1, idx2) in limbs.items():
+                if idx1 < len(n_kpts) and idx2 < len(n_kpts):
+                    p1, p2 = n_kpts[idx1], n_kpts[idx2]
+                    if not (np.isnan(p1).any() or np.isnan(p2).any()):
+                        length = np.linalg.norm(p1 - p2)
+                        avg_lengths[limb_name].append(length)
         
-        self.gait_features[track_id].update(features)
-
-    def _analyze_head_movement(self, track_id, keypoints_seq):
-        """Analyze head position and movement relative to body"""
+        # Calculate mean lengths
+        mean_lengths = {}
+        for limb_name, lengths in avg_lengths.items():
+            if lengths:
+                mean_lengths[limb_name] = np.mean(lengths)
+        
+        # Calculate ratios (if we have torso as reference)
+        if 'torso' in mean_lengths and mean_lengths['torso'] > 0:
+            for limb_name, length in mean_lengths.items():
+                if limb_name != 'torso':
+                    features[f'inv_ratio_{limb_name}_to_torso'] = length / mean_lengths['torso']
+        
+        # Arm symmetry (left vs right)
+        if 'upper_arm_right' in mean_lengths and 'upper_arm_left' in mean_lengths:
+            features['inv_arm_symmetry_upper'] = mean_lengths['upper_arm_left'] / mean_lengths['upper_arm_right']
+            
+        if 'lower_arm_right' in mean_lengths and 'lower_arm_left' in mean_lengths:
+            features['inv_arm_symmetry_lower'] = mean_lengths['lower_arm_left'] / mean_lengths['lower_arm_right']
+            
+        # Leg symmetry (left vs right)
+        if 'upper_leg_right' in mean_lengths and 'upper_leg_left' in mean_lengths:
+            features['inv_leg_symmetry_upper'] = mean_lengths['upper_leg_left'] / mean_lengths['upper_leg_right']
+            
+        if 'lower_leg_right' in mean_lengths and 'lower_leg_left' in mean_lengths:
+            features['inv_leg_symmetry_lower'] = mean_lengths['lower_leg_left'] / mean_lengths['lower_leg_right']
+        
+        return features
+    
+    def _calculate_temporal_features(self, normalized_kpts_list):
+        """Calculate temporal features from normalized keypoints"""
         features = {}
         
-        # Track head position relative to shoulders
-        head_angles = []
-        head_heights = []
+        # Need enough frames for temporal analysis
+        if len(normalized_kpts_list) < 10:
+            return features
         
-        for keypoints in keypoints_seq:
-            if (len(keypoints) > self.nose and
-                len(keypoints) > self.left_shoulder and
-                len(keypoints) > self.right_shoulder and
-                self.is_valid_keypoint(keypoints[self.nose]) and
-                self.is_valid_keypoint(keypoints[self.left_shoulder]) and
-                self.is_valid_keypoint(keypoints[self.right_shoulder])):
-                
-                # Calculate mid-shoulder position
-                mid_shoulder = (keypoints[self.left_shoulder] + keypoints[self.right_shoulder]) / 2
-                
-                # Vector from mid-shoulder to nose
-                head_vector = keypoints[self.nose] - mid_shoulder
-                vertical = np.array([0, -1])  # Pointing up
-                
-                # Calculate head angle from vertical
-                cos_angle = np.dot(head_vector, vertical) / (np.linalg.norm(head_vector) * np.linalg.norm(vertical))
-                angle = np.arccos(np.clip(cos_angle, -1.0, 1.0)) * 180 / np.pi
-                head_angles.append(angle)
-                
-                # Calculate relative head height (how high the person holds their head)
-                shoulder_width = np.linalg.norm(keypoints[self.left_shoulder] - keypoints[self.right_shoulder])
-                if shoulder_width > 0:  # Avoid division by zero
-                    relative_height = np.linalg.norm(head_vector) / shoulder_width
-                    head_heights.append(relative_height)
+        # Track ankle positions for gait cycle analysis
+        left_ankle_positions = []
+        right_ankle_positions = []
         
-        if head_angles:
-            features['head_angle_mean'] = np.mean(head_angles)
-            features['head_angle_std'] = np.std(head_angles)
+        for n_kpts in normalized_kpts_list:
+            if 13 < len(n_kpts) and 10 < len(n_kpts):
+                left_ankle = n_kpts[13]
+                right_ankle = n_kpts[10]
+                if not (np.isnan(left_ankle).any() or np.isnan(right_ankle).any()):
+                    left_ankle_positions.append(left_ankle)
+                    right_ankle_positions.append(right_ankle)
         
-        if head_heights:
-            features['head_height_ratio'] = np.mean(head_heights)
+        # Need enough ankle positions
+        if len(left_ankle_positions) < 10 or len(right_ankle_positions) < 10:
+            return features
+            
+        # Calculate stride length (maximum distance between consecutive positions)
+        left_strides = [np.linalg.norm(left_ankle_positions[i] - left_ankle_positions[i-1]) 
+                      for i in range(1, len(left_ankle_positions))]
+        right_strides = [np.linalg.norm(right_ankle_positions[i] - right_ankle_positions[i-1]) 
+                       for i in range(1, len(right_ankle_positions))]
         
-        self.gait_features[track_id].update(features)
-
-    def _analyze_motion_dynamics(self, track_id, keypoints_seq):
-        """Analyze acceleration/deceleration patterns in movement"""
+        if left_strides and right_strides:
+            features['inv_mean_stride_length'] = (np.mean(left_strides) + np.mean(right_strides)) / 2
+            features['inv_stride_length_std'] = (np.std(left_strides) + np.std(right_strides)) / 2
+            features['inv_stride_symmetry'] = np.mean(left_strides) / np.mean(right_strides) if np.mean(right_strides) > 0 else 1.0
+        
+        # Calculate periodic patterns in ankle movement
+        if len(left_ankle_positions) > 20:
+            # Use x-coordinate (horizontal movement) for step detection
+            left_x = [pos[0] for pos in left_ankle_positions]
+            right_x = [pos[0] for pos in right_ankle_positions]
+            
+            # Simple frequency analysis (detect peaks)
+            left_peaks = self._detect_peaks(left_x)
+            right_peaks = self._detect_peaks(right_x)
+            
+            if left_peaks and right_peaks:
+                # Average step cycle duration (in frames)
+                features['inv_left_step_cycle'] = np.mean(np.diff(left_peaks))
+                features['inv_right_step_cycle'] = np.mean(np.diff(right_peaks))
+                features['inv_step_cycle_ratio'] = features['inv_left_step_cycle'] / features['inv_right_step_cycle'] if features['inv_right_step_cycle'] > 0 else 1.0
+        
+        return features
+    
+    def _calculate_postural_features(self, normalized_kpts_list):
+        """Calculate postural features from normalized keypoints"""
         features = {}
         
-        # Track hip center position
-        hip_positions = []
+        # Calculate posture angles
+        torso_angles = []  # Angle of torso with vertical
+        shoulder_angles = []  # Angle of shoulders with horizontal
+        hip_angles = []  # Angle of hips with horizontal
         
-        for keypoints in keypoints_seq:
-            if (len(keypoints) > self.left_hip and 
-                len(keypoints) > self.right_hip and
-                self.is_valid_keypoint(keypoints[self.left_hip]) and
-                self.is_valid_keypoint(keypoints[self.right_hip])):
-                
-                # Calculate mid-hip position
-                mid_hip = (keypoints[self.left_hip] + keypoints[self.right_hip]) / 2
-                hip_positions.append(mid_hip)
+        # For torso twist calculation, we need paired angles from the same frame
+        paired_angles = []  # Store (shoulder_angle, hip_angle) pairs
         
-        if len(hip_positions) >= 3:  # Need at least 3 points for acceleration
-            hip_positions = np.array(hip_positions)
+        for n_kpts in normalized_kpts_list:
+            # Torso angle (neck to mid-hip)
+            neck_idx, left_hip_idx, right_hip_idx = 1, 11, 8
+            if (neck_idx < len(n_kpts) and left_hip_idx < len(n_kpts) and right_hip_idx < len(n_kpts) and
+                    not np.isnan(n_kpts[neck_idx]).any() and
+                    not np.isnan(n_kpts[left_hip_idx]).any() and
+                    not np.isnan(n_kpts[right_hip_idx]).any()):
+                mid_hip = (n_kpts[left_hip_idx] + n_kpts[right_hip_idx]) / 2
+                vertical = np.array([0.0, 1.0])  # Vertical direction
+                torso = n_kpts[neck_idx] - mid_hip
+                if np.linalg.norm(torso) > 0:
+                    torso = torso / np.linalg.norm(torso)
+                    torso_angle = np.arccos(np.clip(np.dot(torso, vertical), -1.0, 1.0))
+                    torso_angles.append(torso_angle)
             
-            # Calculate velocities and accelerations
-            velocities = np.diff(hip_positions, axis=0)
-            accelerations = np.diff(velocities, axis=0)
+            # Track both shoulder and hip angles from the same frame for torso twist
+            shoulder_angle = None
+            hip_angle = None
             
-            # Speed changes (how quickly the person changes walking speed)
-            speed_changes = np.diff(np.linalg.norm(velocities, axis=1))
+            # Shoulder angle (left to right shoulder)
+            left_shoulder_idx, right_shoulder_idx = 5, 2
+            if (left_shoulder_idx < len(n_kpts) and right_shoulder_idx < len(n_kpts) and
+                    not np.isnan(n_kpts[left_shoulder_idx]).any() and
+                    not np.isnan(n_kpts[right_shoulder_idx]).any()):
+                shoulder_vector = n_kpts[right_shoulder_idx] - n_kpts[left_shoulder_idx]
+                horizontal = np.array([1.0, 0.0])  # Horizontal direction
+                if np.linalg.norm(shoulder_vector) > 0:
+                    shoulder_vector = shoulder_vector / np.linalg.norm(shoulder_vector)
+                    shoulder_angle = np.arccos(np.clip(np.dot(shoulder_vector, horizontal), -1.0, 1.0))
+                    shoulder_angles.append(shoulder_angle)
             
-            if len(speed_changes) > 0:
-                features['acceleration_capacity'] = np.percentile(speed_changes, 95)
-                features['deceleration_capacity'] = np.percentile(speed_changes, 5)
-                features['speed_stability'] = 1.0 / (1.0 + np.std(np.linalg.norm(velocities, axis=1)))
-        
-        self.gait_features[track_id].update(features)
-
-    def _analyze_movement_periodicity(self, track_id, keypoints_seq):
-        """Analyze the periodicity of movement using frequency analysis"""
-        features = {}
-        
-        # Get ankles y-positions (vertical movement)
-        left_ankle_y = []
-        right_ankle_y = []
-        
-        for keypoints in keypoints_seq:
-            if len(keypoints) > self.left_ankle and self.is_valid_keypoint(keypoints[self.left_ankle]):
-                left_ankle_y.append(keypoints[self.left_ankle][1])
+            # Hip angle (left to right hip)
+            left_hip_idx, right_hip_idx = 11, 8
+            if (left_hip_idx < len(n_kpts) and right_hip_idx < len(n_kpts) and
+                    not np.isnan(n_kpts[left_hip_idx]).any() and
+                    not np.isnan(n_kpts[right_hip_idx]).any()):
+                hip_vector = n_kpts[right_hip_idx] - n_kpts[left_hip_idx]
+                horizontal = np.array([1.0, 0.0])  # Horizontal direction
+                if np.linalg.norm(hip_vector) > 0:
+                    hip_vector = hip_vector / np.linalg.norm(hip_vector)
+                    hip_angle = np.arccos(np.clip(np.dot(hip_vector, horizontal), -1.0, 1.0))
+                    hip_angles.append(hip_angle)
             
-            if len(keypoints) > self.right_ankle and self.is_valid_keypoint(keypoints[self.right_ankle]):
-                right_ankle_y.append(keypoints[self.right_ankle][1])
+            # If we have both shoulder and hip angles for this frame, store them as a pair
+            if shoulder_angle is not None and hip_angle is not None:
+                paired_angles.append((shoulder_angle, hip_angle))
         
-        # Need enough points for frequency analysis
-        if len(left_ankle_y) >= 20 and len(right_ankle_y) >= 20:
-            try:
-                from scipy.fft import fft
-                
-                # Apply FFT to ankle movements
-                left_fft = np.abs(fft(left_ankle_y - np.mean(left_ankle_y)))
-                right_fft = np.abs(fft(right_ankle_y - np.mean(right_ankle_y)))
-                
-                # Get dominant frequencies (excluding DC component)
-                left_freq_idx = np.argsort(left_fft[1:len(left_fft)//2])[-3:] + 1
-                right_freq_idx = np.argsort(right_fft[1:len(right_fft)//2])[-3:] + 1
-                
-                # Store dominant frequencies and their amplitudes
-                features['left_dominant_freq'] = left_freq_idx[0] / len(left_ankle_y)
-                features['right_dominant_freq'] = right_freq_idx[0] / len(right_ankle_y)
-                features['gait_rhythm_ratio'] = min(features['left_dominant_freq'], features['right_dominant_freq']) / \
-                                            max(features['left_dominant_freq'], features['right_dominant_freq'])
-            except Exception:
-                pass
+        # Calculate statistics
+        if torso_angles:
+            features['inv_torso_angle_mean'] = np.mean(torso_angles)
+            features['inv_torso_angle_std'] = np.std(torso_angles)
         
-        self.gait_features[track_id].update(features)
-
+        if shoulder_angles:
+            features['inv_shoulder_angle_mean'] = np.mean(shoulder_angles)
+            features['inv_shoulder_angle_std'] = np.std(shoulder_angles)
+        
+        if hip_angles:
+            features['inv_hip_angle_mean'] = np.mean(hip_angles)
+            features['inv_hip_angle_std'] = np.std(hip_angles)
+                
+        # Calculate relative angle between shoulders and hips (torso twist)
+        # Only using frames where both measurements are available
+        if paired_angles:
+            shoulder_hip_diffs = [abs(s_angle - h_angle) for s_angle, h_angle in paired_angles]
+            features['inv_torso_twist_mean'] = np.mean(shoulder_hip_diffs)
+            features['inv_torso_twist_std'] = np.std(shoulder_hip_diffs)
+        
+        return features
+    
+    def _detect_peaks(self, signal, min_height=None, min_distance=3):
+        """Simple peak detection for gait cycle analysis"""
+        if min_height is None:
+            min_height = np.mean(signal)
+            
+        peaks = []
+        for i in range(1, len(signal) - 1):
+            if signal[i] > min_height and signal[i] > signal[i-1] and signal[i] > signal[i+1]:
+                # Found a peak
+                if not peaks or i - peaks[-1] >= min_distance:
+                    peaks.append(i)
+        
+        return peaks
+    
     def _calculate_angle(self, p1, p2, p3):
-        """Calculate angle between three points in degrees"""
+        """Calculate angle between three points (in radians)"""
         v1 = p1 - p2
         v2 = p3 - p2
         
-        cos_angle = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        angle = np.arccos(np.clip(cos_angle, -1.0, 1.0)) * 180 / np.pi
-        
-        return angle
-    
-    def export_features_csv(self, filename):
-        """Export all gait features to CSV file"""
-        data = []
-        
-        for track_id, features in self.gait_features.items():
-            # Ensure all expected features are present
-            features_with_id = {'track_id': track_id}
-            features_with_id.update(features)
-            data.append(features_with_id)
-        
-        if data:
-            df = pd.DataFrame(data)
+        # Normalize vectors
+        if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+            v1 = v1 / np.linalg.norm(v1)
+            v2 = v2 / np.linalg.norm(v2)
             
-            # Check feature count
-            expected_features = 26  # Update this to match your expected count
-            actual_features = len(df.columns) - 1  # -1 for track_id
-            
-            if actual_features < expected_features:
-                print(f"WARNING: Only extracted {actual_features}/{expected_features} features")
-                # Identify missing features
-                print(f"Missing features may affect identification accuracy")
-                
-            df.to_csv(filename, index=False)
-            print(f"Exported {len(data)} gait feature records with {actual_features} features")
-            return True
-        else:
-            print("No gait features to export")
-            return False
+            # Calculate angle (in radians)
+            dot_product = np.dot(v1, v2)
+            angle = np.arccos(np.clip(dot_product, -1.0, 1.0))
+            return angle
+        
+        return None
 
     def get_feature_vector(self, track_id):
-        """Get a normalized feature vector for machine learning models"""
-        if track_id not in self.gait_features:
+        """Get a feature vector (flat numpy array) for a track"""
+        features = self.get_features(track_id)
+        invariant_features = self.calculate_view_invariant_features(track_id)
+        
+        # Combine regular and invariant features
+        all_features = {}
+        if features is not None:
+            all_features.update(features)
+        if invariant_features is not None:
+            all_features.update(invariant_features)
+            
+        if not all_features:
             return None
             
-        features = self.gait_features[track_id]
+        # Convert to numpy array
+        feature_names = sorted(all_features.keys())
+        feature_vector = np.array([all_features[name] for name in feature_names])
         
-        # Extract the features we want to use for identification
-        # Prioritize direction-invariant features
-        vector_keys = [
-            # Body proportions (view invariant)
-            'height_width_ratio', 'leg_torso_ratio', 'upper_lower_leg_ratio',
-            # Walking pattern features
-            'left_stride_consistency', 'right_stride_consistency',
-            'arm_swing_symmetry', 'left_arm_swing_area', 'right_arm_swing_area',
-            # Joint angles
-            'left_elbow_angle_range', 'right_elbow_angle_range',
-            'left_knee_angle_range', 'right_knee_angle_range',
-            'elbow_angle_symmetry', 'knee_angle_symmetry',
-            # Posture
-            'spine_angle_mean', 'spine_angle_std',
-            # Gait timing
-            'step_phase_difference'
-        ]
-        vector_keys.extend([
-            'com_vertical_oscillation', 'com_lateral_stability', 'path_smoothness',
-            'weight_transfer_stability', 'weight_distribution_symmetry',
-            'head_angle_mean', 'head_height_ratio',
-            'speed_stability', 'gait_rhythm_ratio'
-        ])
-        
-        # Create vector using available features
-        vector = []
-        for key in vector_keys:
-            if key in features:
-                vector.append(features[key])
-            else:
-                vector.append(np.nan)
-        
-        # Handle missing values
-        vector = np.array(vector)
-        vector = np.nan_to_num(vector, nan=0.0)
-        
-        return vector
+        return feature_vector
     
-    def get_keypoint_sequences(self):
-        """Extract raw keypoint sequences for each track ID"""
-        sequences = {}
+    def export_features_csv(self, csv_path):
+        """Export features to CSV file"""
+        results = []
         
-        for track_id, history in self.track_history.items():
-            if len(history) < self.min_frames_for_analysis:
-                continue
+        for track_id in self.track_history:
+            features = self.get_features(track_id)
+            invariant_features = self.calculate_view_invariant_features(track_id)
             
-            # Extract keypoints in sequence
-            keypoints_seq = []
-            for _, kpts in history:
-                if kpts is not None and len(kpts) > 0:
-                    # Flatten keypoints to a single vector [x1,y1,x2,y2,...,xn,yn]
-                    flattened = []
-                    for i in range(len(kpts)):
-                        if self.is_valid_keypoint(kpts[i]):
-                            flattened.extend(kpts[i])
-                        else:
-                            # Add zeros for missing keypoints
-                            flattened.extend([0, 0])
-                    keypoints_seq.append(flattened)
-            
-            if keypoints_seq:
-                sequences[track_id] = keypoints_seq
-        
-        return sequences
-
-    def export_sequences_for_lstm(self, filename):
-        """Export skeleton sequences to a file for LSTM training"""
-        sequences = self.get_keypoint_sequences()
-        
-        if sequences:
-            # Save using torch.save or numpy
-            np.save(filename, sequences)
-            print(f"Exported {len(sequences)} skeleton sequences")
-            return True
-        else:
-            print("No sequences to export")
-            return False
-
-    def normalize_keypoints(self, keypoints_seq):
-        """Normalize keypoints for neural network input"""
-        # Center keypoints around hip center
-        normalized = []
-        
-        for keypoints in keypoints_seq:
-            if len(keypoints) > self.left_hip and len(keypoints) > self.right_hip:
-                hip_center = (keypoints[self.left_hip] + keypoints[self.right_hip]) / 2
+            if features or invariant_features:
+                row = {'track_id': track_id}
                 
-                # Shift to center
-                centered = [kp - hip_center if self.is_valid_keypoint(kp) else np.zeros(2) for kp in keypoints]
+                # Add regular features
+                if features:
+                    for k, v in features.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            row[k] = v
                 
-                # Scale by the hip-shoulder distance for size invariance
-                if (len(keypoints) > self.left_shoulder and 
-                    len(keypoints) > self.right_shoulder and
-                    self.is_valid_keypoint(keypoints[self.left_shoulder]) and
-                    self.is_valid_keypoint(keypoints[self.right_shoulder])):
-                    
-                    shoulder_center = (keypoints[self.left_shoulder] + keypoints[self.right_shoulder]) / 2
-                    scale_factor = np.linalg.norm(shoulder_center - hip_center)
-                    
-                    if scale_factor > 0:
-                        normalized_kpts = [kp / scale_factor for kp in centered]
-                        normalized.append(normalized_kpts)
+                # Add invariant features
+                if invariant_features:
+                    for k, v in invariant_features.items():
+                        if isinstance(v, (int, float, np.integer, np.floating)):
+                            row[k] = v
+                
+                results.append(row)
         
-        return normalized
-
-
-class SkeletonSequence(Dataset):
-    """Dataset class for skeleton sequences with corresponding person IDs"""
-    
-    def __init__(self, sequences, labels, seq_length=30, transform=None):
-        """
-        Args:
-            sequences: Dictionary mapping track_id to list of keypoints sequences
-            labels: Dictionary mapping track_id to person identity
-            seq_length: Fixed sequence length for LSTM input
-            transform: Optional transform to apply to sequences
-        """
-        self.sequences = []
-        self.labels = []
-        self.label_map = {}  # Maps string labels to integers
-        self.inv_label_map = {}  # Inverse mapping
-        self.seq_length = seq_length
-        self.transform = transform
-        
-        # Process sequences and labels
-        label_idx = 0
-        for track_id, seq in sequences.items():
-            if track_id in labels:
-                # Create fixed-length sequences
-                for i in range(0, max(1, len(seq) - seq_length + 1), seq_length // 2):  # 50% overlap
-                    # Extract sequence chunk
-                    end_idx = min(i + seq_length, len(seq))
-                    if end_idx - i < seq_length // 2:  # Skip if too short
-                        continue
-                        
-                    chunk = seq[i:end_idx]
-                    
-                    # Pad if necessary
-                    if len(chunk) < seq_length:
-                        # Pad with zeros
-                        pad_size = seq_length - len(chunk)
-                        chunk = chunk + [np.zeros_like(chunk[0])] * pad_size
-                    
-                    # Add to dataset
-                    self.sequences.append(chunk)
-                    
-                    # Process label
-                    label = labels[track_id]
-                    if label not in self.label_map:
-                        self.label_map[label] = label_idx
-                        self.inv_label_map[label_idx] = label
-                        label_idx += 1
-                    
-                    self.labels.append(self.label_map[label])
-    
-    def __len__(self):
-        return len(self.sequences)
-    
-    def __getitem__(self, idx):
-        seq = self.sequences[idx]
-        label = self.labels[idx]
-        
-        # Convert to tensor
-        seq = np.array(seq)
-        
-        # Apply transform if available
-        if self.transform:
-            seq = self.transform(seq)
-        
-        # Convert to tensor
-        seq_tensor = torch.tensor(seq, dtype=torch.float32)
-        label_tensor = torch.tensor(label, dtype=torch.long)
-        
-        return seq_tensor, label_tensor
-    
-    def get_num_classes(self):
-        """Return the number of unique classes"""
-        return len(self.label_map)
-    
-    def get_label_mapping(self):
-        """Return the label mapping dictionary"""
-        return self.inv_label_map
-    
-class SkeletonLSTM(nn.Module):
-    """LSTM model for skeleton sequence classification"""
-    
-    def __init__(self, input_size, hidden_size, num_layers, num_classes, dropout=0.2):
-        """
-        Args:
-            input_size: Number of features in input (keypoints x 2)
-            hidden_size: Size of LSTM hidden states
-            num_layers: Number of LSTM layers
-            num_classes: Number of output classes
-            dropout: Dropout probability
-        """
-        super(SkeletonLSTM, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # LSTM layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0)
-        
-        # Attention layer
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.Tanh(),
-            nn.Linear(hidden_size // 2, 1)
-        )
-        
-        # Classification layers
-        self.fc = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, num_classes)
-        )
-        
-    def forward(self, x):
-        # x shape: (batch_size, sequence_length, input_size)
-        
-        # LSTM output
-        lstm_out, _ = self.lstm(x)
-        # lstm_out shape: (batch_size, sequence_length, hidden_size)
-        
-        # Attention mechanism
-        attn_weights = self.attention(lstm_out)
-        attn_weights = torch.softmax(attn_weights, dim=1)
-        # attn_weights shape: (batch_size, sequence_length, 1)
-        
-        # Apply attention to LSTM output
-        context = torch.sum(lstm_out * attn_weights, dim=1)
-        # context shape: (batch_size, hidden_size)
-        
-        # Classification
-        output = self.fc(context)
-        # output shape: (batch_size, num_classes)
-        
-        return output
-
-# Helper function to visualize gait features on frame
-def visualize_gait_features(frame, track_id, gait_features, x_pos, y_pos):
-    """Draw gait features on the frame for a specific track"""
-    if track_id not in gait_features:
-        return frame
-    
-    features = gait_features[track_id]
-    y_offset = 0
-    
-    # Show movement direction if available
-    if 'movement_direction' in features:
-        text = f"Direction: {features['movement_direction']}"
-        cv.putText(frame, text, (x_pos, y_pos + y_offset), 
-                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        y_offset += 20
-    
-    # Display the most distinctive features for identification
-    key_features = [
-        'height_width_ratio', 'leg_torso_ratio', 
-        'arm_swing_symmetry', 'spine_angle_mean'
-    ]
-    
-    for key in key_features:
-        if key in features:
-            value = features[key]
-            text = f"{key}: {value:.2f}"
-            cv.putText(frame, text, (x_pos, y_pos + y_offset), 
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            y_offset += 20
-    
-    return frame
+        if results:
+            df = pd.DataFrame(results)
+            df.to_csv(csv_path, index=False)
+            print(f"Exported {len(results)} gait feature records with {len(df.columns) - 1} features")

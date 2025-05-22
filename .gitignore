@@ -1,6 +1,7 @@
 /model/*
 /results/*
-
+/results1/*
+*.zip
 *.pt
 *.csv
 *.json
