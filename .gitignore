@@ -1,9 +1,11 @@
 /model/*
 /results/*
 /results1/*
+models/saved/*
 *.zip
 *.pt
 *.csv
 *.json
 *.log
 *npy
+!/results*/

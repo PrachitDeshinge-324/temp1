@@ -86,7 +86,7 @@ class DeepSORTTracker:
         boxes = []
         confidences = []
         
-        print(f"Processing {len(detections)} detections with DeepSORT")
+        # print(f"Processing {len(detections)} detections with DeepSORT")
         
         for det in detections:
             x1, y1, x2, y2 = det.bbox
@@ -117,5 +117,5 @@ class DeepSORTTracker:
                 track_id=track_id
             ))
         
-        print(f"DeepSORT returned {len(results)} tracked objects")
+        # print(f"DeepSORT returned {len(results)} tracked objects")
         return results

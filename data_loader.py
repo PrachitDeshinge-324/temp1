@@ -34,53 +34,25 @@ def prepare_data_lstm(npy_file, id_to_name_file, seq_length=30, stride=15):
     """
     # Load data
     data = np.load(npy_file)
-    
-    with open(id_to_name_file, 'r') as f:
-        id_to_name = json.load(f)
-    
-    # Convert string keys to integers
-    id_to_name = {int(k): v for k, v in id_to_name.items()}
-    
-    # Create mapping from ID to label index
-    unique_ids = sorted(list(id_to_name.keys()))
-    id_to_label = {id_val: i for i, id_val in enumerate(unique_ids)}
-    
-    # Group data by ID and frame
+    track_ids = data[:, 0].astype(int)
+    valid_track_ids = [tid for tid in np.unique(track_ids) if tid > 0]
     sequences = []
     labels = []
-    
-    # Group by track_id
-    track_groups = {}
-    for row in data:
-        track_id = int(row[0])
-        if track_id not in track_groups:
-            track_groups[track_id] = []
-        track_groups[track_id].append(row)
-    
-    # Create sequences of length seq_length for each track
-    for track_id, rows in track_groups.items():
-        # Only use tracks that have a name
-        if track_id not in id_to_name:
-            continue
-        
-        # Sort by frame index
-        rows.sort(key=lambda x: x[1])
-        
-        # Create sliding window sequences with overlap
-        for i in range(0, len(rows) - seq_length + 1, stride):
-            seq = np.array(rows[i:i+seq_length])
-            # Remove track_id and frame_idx columns
-            features = seq[:, 2:].astype(np.float32)  # Keep only features
-            
-            # Apply data normalization (Z-score normalization per sequence)
-            mean = np.mean(features, axis=0, keepdims=True)
-            std = np.std(features, axis=0, keepdims=True) + 1e-8  # Add epsilon to avoid division by zero
-            features = (features - mean) / std
-            
-            sequences.append(features)
-            labels.append(id_to_label[track_id])
-    
-    return np.array(sequences), np.array(labels), id_to_name, id_to_label
+    for tid in valid_track_ids:
+        tid_rows = data[track_ids == tid]
+        # Optionally, sort by frame index if needed
+        tid_rows = tid_rows[np.argsort(tid_rows[:, 1])]
+        # Sliding window
+        for start in range(0, len(tid_rows) - seq_length + 1, stride):
+            seq = tid_rows[start:start+seq_length]
+            if seq.shape[0] == seq_length:
+                sequences.append(seq)
+                labels.append(tid)
+    # Load id_to_name and build id_to_label
+    with open(id_to_name_file) as f:
+        id_to_name = json.load(f)
+    id_to_label = {int(k): i for i, k in enumerate(sorted(id_to_name.keys(), key=int))}
+    return sequences, labels, id_to_name, id_to_label
 
 def create_data_loaders(sequences, labels, batch_size=16, val_ratio=0.15, test_ratio=0.15, random_state=42):
     """

@@ -62,8 +62,8 @@ class VideoProcessor:
                 # Write or display frame
                 if self.writer:
                     self.writer.write(processed_frame)
-                
-                if not self.headless and self.output_path is None:
+
+                if not self.headless:
                     cv.imshow('Video Processing', processed_frame)
                     if cv.waitKey(1) & 0xFF == ord('q'):
                         break

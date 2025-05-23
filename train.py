@@ -223,9 +223,9 @@ def preprocess_nan_values(data_path):
 
 def main():
     parser = argparse.ArgumentParser(description='Train LSTM model for gait recognition')
-    parser.add_argument('--data', type=str, default='results1/industrial_gait_features_flat.npy', 
+    parser.add_argument('--data', type=str, default='results2/industrial_gait_features_flat.npy', 
                         help='Path to numpy data file')
-    parser.add_argument('--id_map', type=str, default='results1/id_to_name.json', 
+    parser.add_argument('--id_map', type=str, default='results2/id_to_name.json', 
                         help='Path to ID to name mapping file')
     parser.add_argument('--seq_length', type=int, default=30, help='Sequence length')
     parser.add_argument('--stride', type=int, default=15, help='Stride for sliding window')
@@ -278,10 +278,61 @@ def main():
     
     # Calculate class distribution
     unique_labels, counts = np.unique(labels, return_counts=True)
+    # Reverse mapping: label index -> person_id
+    label_to_id = {v: k for k, v in id_to_label.items()}
     for label, count in zip(unique_labels, counts):
-        person_id = list(id_to_label.keys())[list(id_to_label.values()).index(label)]
-        name = id_to_name.get(person_id, "Unknown")
+        person_id = label_to_id.get(label, "Unknown")
+        name = id_to_name.get(str(person_id), "Unknown")
         print(f"Class {label} ({person_id}, {name}): {count} samples")
+    # Check for invalid track IDs in sequences
+    print("Checking for invalid track IDs in sequences...")
+    valid_track_ids = set(id_to_label.keys())
+    invalid_sequences = []
+
+    for i, seq in enumerate(sequences):
+        track_id = int(seq[0][0])
+        if track_id not in valid_track_ids:
+            invalid_sequences.append(i)
+            print(f"Found invalid track_id: {track_id} in sequence {i}")
+
+    # Option 1: Filter out sequences with invalid track IDs
+    if invalid_sequences:
+        print(f"Filtering out {len(invalid_sequences)} sequences with invalid track IDs")
+        valid_indices = [i for i in range(len(sequences)) if i not in invalid_sequences]
+        sequences = [sequences[i] for i in valid_indices]
+        
+    # Generate labels only for valid sequences
+    labels = [id_to_label[int(seq[0][0])] for seq in sequences]
+    labels = np.array(labels)
+    
+    sequences = np.array(sequences)
+    # Identify which classes remain after filtering
+    unique_remaining_labels = np.unique(labels)
+    print(f"Final dataset: {len(sequences)} sequences with {len(unique_remaining_labels)} unique classes")
+    print(f"Sequences shape: {sequences.shape}")
+    
+    # Create filtered versions of id_to_name and id_to_label that only include classes present in the data
+    filtered_id_to_name = {}
+    filtered_id_to_label = {}
+    label_to_id = {v: k for k, v in id_to_label.items()}  # Reverse mapping from label to ID
+    
+    # Create a new label mapping that's consecutive (0, 1, 2, ...)
+    new_label_mapping = {old_label: new_label for new_label, old_label in enumerate(unique_remaining_labels)}
+    
+    # Update the labels array with the new mapping
+    labels = np.array([new_label_mapping[label] for label in labels])
+    
+    # Create the filtered dictionaries
+    for old_label in unique_remaining_labels:
+        person_id = label_to_id[old_label]
+        new_label = new_label_mapping[old_label]
+        name = id_to_name.get(str(person_id), f"Person_{person_id}")
+        
+        filtered_id_to_name[str(person_id)] = name
+        filtered_id_to_label[person_id] = new_label
+    
+    print(f"Filtered ID to name mapping: {filtered_id_to_name}")
+    print(f"Filtered ID to label mapping: {filtered_id_to_label}")
     
     # Create data loaders
     train_loader, val_loader, test_loader, class_weights = create_data_loaders(
@@ -295,16 +346,16 @@ def main():
     print(f"Test set: {len(test_loader.dataset)} samples")
     print(f"Class weights: {class_weights}")
     
-    # Create model
+    # Create model with the CORRECT number of classes (not the original number)
     input_size = sequences.shape[2]  # Feature dimension
-    num_classes = len(id_to_name)
+    num_classes = len(unique_remaining_labels)  # Use the actual number of classes in filtered data
     
     if args.model == 'lstm':
         model = GaitLSTM(
             input_size=input_size,
             hidden_size=args.hidden_size,
             num_layers=args.num_layers,
-            num_classes=num_classes,
+            num_classes=num_classes,  # Using correct number of classes
             dropout=args.dropout
         )
         print(f"Created LSTM model with input_size={input_size}, hidden_size={args.hidden_size}, "
@@ -314,7 +365,7 @@ def main():
             input_size=input_size,
             hidden_size=args.hidden_size,
             num_layers=args.num_layers,
-            num_classes=num_classes,
+            num_classes=num_classes,  # Using correct number of classes
             dropout=args.dropout
         )
         print(f"Created CNN-LSTM model with input_size={input_size}, hidden_size={args.hidden_size}, "
@@ -328,7 +379,6 @@ def main():
     criterion = nn.CrossEntropyLoss(weight=class_weights.to(device))
     
     # Train model
-        # Train model
     model, train_losses, val_losses, train_accs, val_accs = train_lstm_model(
         model=model,
         train_loader=train_loader,
@@ -340,13 +390,13 @@ def main():
         weight_decay=args.weight_decay,
         device=device,
         save_dir=model_save_dir,
-        id_to_name=id_to_name,
-        id_to_label=id_to_label
+        id_to_name=filtered_id_to_name,  # Use filtered dictionaries
+        id_to_label=filtered_id_to_label  # Use filtered dictionaries
     )
     
     print(f"Training complete! Best model saved to {model_save_dir}")
-    print(f"ID to name mapping: {id_to_name}")
-    print(f"ID to label mapping: {id_to_label}")
+    print(f"ID to name mapping: {filtered_id_to_name}")
+    print(f"ID to label mapping: {filtered_id_to_label}")
 
 if __name__ == "__main__":
     main()
