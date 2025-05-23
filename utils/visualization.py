@@ -11,6 +11,17 @@ class Visualizer:
         self.skeleton = [[16,14],[14,12],[17,15],[15,13],[12,13],[6,12],[7,13],[6,7],
                         [6,8],[7,9],[8,10],[9,11],[2,3],[1,2],[1,3],[2,4],[3,5]]
         
+    def get_color(self, track_id):
+        """Get consistent color for a track ID"""
+        return self.track_colors[int(track_id) % len(self.track_colors)]
+    
+    def draw_bbox(self, frame, bbox, track_id, color):
+        """Draw bounding box with track ID"""
+        x1, y1, x2, y2 = map(int, bbox)
+        cv.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        cv.putText(frame, f"ID: {int(track_id)}", (x1, y1 - 10),
+                   cv.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    
     def draw_fps(self, frame, fps):
         """Draw FPS counter on frame"""
         cv.putText(frame, f"FPS: {int(fps)}", (20, 40), cv.FONT_HERSHEY_SIMPLEX, 
@@ -21,7 +32,7 @@ class Visualizer:
         x1, y1, x2, y2 = map(int, detection.bbox)
         track_id = detection.track_id
         
-        color = self.track_colors[int(track_id) % len(self.track_colors)]
+        color = self.get_color(track_id)
         cv.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         cv.putText(frame, f"ID: {int(track_id)}", (x1, y1 - 10),
                    cv.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)

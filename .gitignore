@@ -8,4 +8,5 @@ models/saved/*
 *.json
 *.log
 *npy
+*.pyc
 !/results*/

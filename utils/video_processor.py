@@ -4,7 +4,7 @@ import tqdm
 from collections import defaultdict
 
 class VideoProcessor:
-    def __init__(self, input_path, start_frame=0, end_frame=None, 
+    def __init__(self, input_path, start_frame=0, end_frame=100, 
                  output_path=None, headless=False):
         self.input_path = input_path
         self.start_frame = start_frame
