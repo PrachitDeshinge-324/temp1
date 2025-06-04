@@ -1,194 +1,238 @@
-"""
-Simple Gait Analysis Main Script
-
-Minimal orchestrator that coordinates detection, pose analysis, and data processing.
-Clean separation of concerns with just the essential workflow.
-"""
-
 import argparse
 import os
-import torch
+import cv2
+import csv
+from tqdm import tqdm
+from utils.yolo import PersonDetector, PoseDetector
+from utils.helper import get_best_device
+from utils.transreid import TransReIDModel, PersonTracker, PersonTrackerKalman
+from utils.visualize import draw_person_detection, draw_keypoints, generate_colors, create_video_writer
 
-# Import our modular components
-from detection_tracking import DetectionTracker
-from pose_analysis import PoseAnalyzer
-from data_processing import DataProcessor
-
-# Import utilities
-from utils.visualization import Visualizer
-from utils.video_processor import VideoProcessor
-
-def parse_args():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description="Gait Analysis with Modular Architecture")
-    
-    # Input/Output
-    parser.add_argument("--video", help="Path to input video file")
-    parser.add_argument("--output", help="Path to output video file (optional)")
-    parser.add_argument("--results_dir", type=str, default="results", 
-                       help="Directory to save all output files")
-    
-    # Model settings
-    parser.add_argument("--use_transreid", action="store_true", default=True,
-                       help="Use TransReID for person tracking")
-    parser.add_argument("--transreid_model", type=str, default="model/transreid_vitbase.pth",
-                       help="Path to TransReID model weights")
-    
-    # Tracking parameters
-    parser.add_argument("--tracking_iou", type=float, default=0.5,
-                       help="IoU threshold for tracking association")
-    parser.add_argument("--tracking_age", type=int, default=30,
-                       help="Maximum age for tracks before deletion")
-    
-    # Processing options
-    parser.add_argument("--buffer_size", type=float, default=0.05,
-                       help="Buffer size ratio around detected person")
-    parser.add_argument("--save_bbox_info", action="store_true", default=False,
-                       help="Save bounding box information to JSON")
-    
-    # Post-processing
-    parser.add_argument("--merge_ids", action="store_true", default=False,
-                       help="Run interactive ID merging after processing")
-    
-    # Display options
-    parser.add_argument("--display", action="store_true", default=False,
-                       help="Display video during processing")
-    parser.add_argument("--save_video", action="store_true", default=False,
-                       help="Save processed video with visualizations")
-    
-    return parser.parse_args()
-
-def get_device_config():
-    """Configure devices for optimal performance"""
-    if torch.cuda.is_available():
-        device = 'cuda'
-        pose_device = 'cuda'
-    elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-        device = 'mps'
-        pose_device = 'cpu'  # MPS might not support pose detection well
-    else:
-        device = 'cpu'
-        pose_device = 'cpu'
-    
-    print(f"Using device: {device}, Pose device: {pose_device}")
-    return device, pose_device
+def get_arguments():
+    parser = argparse.ArgumentParser(description="Process video for person detection, pose estimation, and tracking.")
+    parser.add_argument('--input', type=str, required=True, help='Input video file path')
+    parser.add_argument('--output_dir', type=str, required=True, help='Output folder path')
+    parser.add_argument('--weights_dir', type=str, required=True, help='Weights folder path')
+    parser.add_argument('--transreid_weights', type=str, default=None, help='TransReID weights path')
+    parser.add_argument('--device', type=str, default=get_best_device(), help='Device to run the model on (cpu or cuda)')
+    parser.add_argument('--output_video', action='store_true', help='Generate output video with annotations')
+    parser.add_argument('--display', action='store_true', help='Display video in real-time using cv2.imshow')
+    args = parser.parse_args()
+    if not os.path.isfile(args.input):
+        raise FileNotFoundError(f"Input file {args.input} does not exist.")
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+    if not os.path.exists(args.weights_dir):
+        raise FileNotFoundError(f"Weights folder {args.weights_dir} does not exist.")
+    print(f"Input file: {args.input}")
+    print(f"Output file: {args.output_dir}")
+    print(f"Weights folder: {args.weights_dir}")
+    return args
 
 def main():
-    """Main processing pipeline"""
-    args = parse_args()
+    args = get_arguments()
+    video_path = args.input
+    output_dir = args.output_dir
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise IOError(f"Cannot open video file {video_path}")
+    print(f"Processing video: {video_path}")
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"Total frames in video: {frame_count}")
+    print(f"Video resolution: {frame_width}x{frame_height}")
+    print(f"Video FPS: {fps}")
+
+    # Always initialize video writer to save output video
+    output_video_path = os.path.join(output_dir, "output_with_detections.mp4")
+    video_writer = create_video_writer(output_video_path, fps, frame_width, frame_height)
+    print(f"Output video will be saved to: {output_video_path}")
+    print("Annotations will be displayed on the output video")
     
-    # Setup devices
-    device, pose_device = get_device_config()
-    
-    # Initialize modular components
-    print("Initializing components...")
-    
-    # 1. Detection and Tracking
-    detector_tracker = DetectionTracker(
-        device=device,
-        pose_device=pose_device,
-        use_transreid=args.use_transreid,
-        transreid_model=args.transreid_model,
-        tracking_iou=args.tracking_iou,
-        tracking_age=args.tracking_age
+    if args.display:
+        print("Real-time display enabled - press 'q' to quit, 'p' to pause/resume")
+        cv2.namedWindow('Person Detection & Tracking', cv2.WINDOW_NORMAL)
+        cv2.resizeWindow('Person Detection & Tracking', 960, 540)  # Resize for better viewing
+
+    # Generate colors for person IDs
+    person_colors = generate_colors(50)  # Generate 50 distinct colors
+
+    person_detector = PersonDetector(
+        weights_dir=args.weights_dir,
+        model_filename="yolo11x.pt",
+        device=args.device
     )
-    
-    # 2. Pose Analysis
-    pose_analyzer = PoseAnalyzer(
-        model_pose=detector_tracker.model_pose,
-        pose_device=pose_device,
-        history_length=5
+
+    pose_detector = PoseDetector(
+        weights_dir=args.weights_dir,
+        model_filename="yolo11x-pose.pt",
+        device=args.device
     )
-    
-    # 3. Data Processing
-    data_processor = DataProcessor()
-    
-    # 4. Visualization and Video Processing
-    visualizer = Visualizer()
-    video_processor = VideoProcessor(
-        args.video,
-        output_path=args.output if args.save_video else None,
-        headless=not args.display  # headless is opposite of display
-    )
-    
-    print("Starting video processing...")
-    
-    # Main processing loop
-    def process_frame(frame, frame_count, fps):
-        """Process each frame of the video"""
-        
-        # 1. Detect and track people
-        tracked_detections = detector_tracker.detect_and_track(frame)
-        
-        # 2. Process poses for each detection
-        for detection in tracked_detections:
-            if not hasattr(detection, 'track_id') or detection.track_id <= 0:
-                continue
-            
-            # Collect bounding box info
-            data_processor.collect_bbox_info(detection.track_id, detection.bbox, frame_count)
-            
-            # Process pose
-            pose_results = pose_analyzer.process_pose(frame, detection, frame_count)
-            
-            if pose_results:
-                # Visualize results
-                color = visualizer.get_color(detection.track_id)
+
+    # Initialize TransReID model and tracker if weights provided
+    person_tracker = None
+    use_tracking = False
+    if args.transreid_weights:
+        try:
+            print(f"Loading TransReID model...")
+            transreid_model = TransReIDModel(args.transreid_weights, device=args.device)
+            person_tracker = PersonTrackerKalman(transreid_model, similarity_threshold=0.7, max_disappeared=30)
+            person_tracker.enable_debug(False)  # Enable debug mode for detailed tracking info
+            use_tracking = True
+            print("TransReID model loaded successfully. Enhanced person tracking enabled.")
+            print("Features: Advanced motion prediction, lost track recovery, feature-based matching")
+        except Exception as e:
+            print(f"Warning: Could not load TransReID model: {e}")
+            print("Proceeding without person tracking.")
+            use_tracking = False
+
+    csv_path = os.path.join(output_dir, "detections.csv")
+    with open(csv_path, mode='w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        # Add keypoint columns (for 17 keypoints: x1,y1,x2,y2,...,x17,y17) and person_id
+        keypoint_headers = [f'kp{i}_{axis}' for i in range(1, 18) for axis in ('x', 'y')]
+        headers = ['frame', 'person_id', 'x1', 'y1', 'x2', 'y2'] + keypoint_headers
+        writer.writerow(headers)
+
+        frame_index = 0
+        paused = False
+        with tqdm(total=frame_count, desc="Processing frames") as pbar:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
                 
-                for pose_result in pose_results:
-                    keypoints = pose_result['keypoints']
-                    crop_offset = pose_result['crop_offset']
-                    identity = pose_result['identity']
-                    confidence = pose_result['confidence']
+                bboxes = person_detector.detect(frame)
+                
+                # Extract person crops for tracking
+                person_crops = []
+                for bbox in bboxes:
+                    coords = bbox.flatten().astype(int).tolist()
+                    x1, y1, x2, y2 = coords
+                    crop = frame[y1:y2, x1:x2]
+                    person_crops.append(crop)
+                
+                # Assign person IDs if tracking is enabled
+                person_ids = []
+                if use_tracking and person_crops:
+                    # Convert bboxes to the required format for the tracker
+                    bbox_coords = []
+                    for bbox in bboxes:
+                        coords = bbox.flatten().astype(int).tolist()
+                        bbox_coords.append(coords)
+                    person_ids = person_tracker.assign_ids(person_crops, bbox_coords, frame_index)
+                else:
+                    # If no tracking, use frame-specific IDs (not persistent across frames)
+                    person_ids = list(range(len(person_crops)))
+                
+                # Create a copy of the frame for video output (always save video)
+                output_frame = frame.copy()
+                
+                # Process each detection
+                for i, bbox in enumerate(bboxes):
+                    coords = bbox.flatten().astype(int).tolist()
+                    x1, y1, x2, y2 = coords
                     
-                    # Draw bounding box and ID
-                    visualizer.draw_bbox(frame, detection.bbox, detection.track_id, color)
+                    # Get person ID
+                    person_id = person_ids[i] if i < len(person_ids) else -1
                     
-                    # Draw identity if available
-                    if identity:
-                        visualizer.draw_identity(frame, detection, identity, confidence, color)
+                    # Detect keypoints on the crop
+                    crop = person_crops[i]
+                    keypoints_list = pose_detector.detect(crop)
                     
-                    # Draw keypoints and skeleton
-                    visualizer.draw_keypoints(frame, keypoints, crop_offset[0], crop_offset[1], color)
+                    # If keypoints are detected, extract and save; else, fill with Nones
+                    if keypoints_list and len(keypoints_list) > 0:
+                        # keypoints_list[0] is a Keypoints object
+                        keypoints = keypoints_list[0].xy.flatten().tolist()
+                        # Convert relative keypoints to absolute coordinates
+                        absolute_keypoints = []
+                        for j in range(0, len(keypoints), 2):
+                            abs_x = keypoints[j] + x1 if keypoints[j] is not None else None
+                            abs_y = keypoints[j + 1] + y1 if keypoints[j + 1] is not None else None
+                            absolute_keypoints.extend([abs_x, abs_y])
+                    else:
+                        keypoints = [None] * 34  # 17 keypoints * 2 (x, y)
+                        absolute_keypoints = keypoints
+                    
+                    # Save detection data to CSV
+                    writer.writerow([frame_index, person_id] + coords + keypoints)
+                    
+                    # Always draw annotations on frame
+                    # Get color for this person ID
+                    color = person_colors[person_id % len(person_colors)] if person_id >= 0 else (128, 128, 128)
+                    
+                    # Draw bounding box and person ID
+                    draw_person_detection(output_frame, (x1, y1, x2, y2), person_id, color)
+                    
+                    # Draw keypoints if detected
+                    if absolute_keypoints and any(kp is not None for kp in absolute_keypoints):
+                        draw_keypoints(output_frame, absolute_keypoints, person_id, color)
+                
+                # Write frame to output video (always save video with annotations)
+                video_writer.write(output_frame)
+                
+                # Display frame in real-time if requested
+                if args.display:
+                    # Handle pause functionality
+                    while paused:
+                        key = cv2.waitKey(30) & 0xFF
+                        if key == ord('p'):  # Resume
+                            paused = False
+                        elif key == ord('q'):  # Quit
+                            break
+                    
+                    if not paused:
+                        cv2.imshow('Person Detection & Tracking', output_frame)
+                        key = cv2.waitKey(1) & 0xFF
+                        if key == ord('q'):  # Quit
+                            break
+                        elif key == ord('p'):  # Pause
+                            paused = True
+                
+                frame_index += 1
+                pbar.update(1)
+                
+                # Print tracking statistics every 100 frames
+                if use_tracking and frame_index % 100 == 0:
+                    stats = person_tracker.get_stats()
+                    print(f"\nFrame {frame_index}: {stats['active_persons']} active, "
+                          f"{stats['confirmed_persons']} confirmed, "
+                          f"{stats['recovery_count']} recoveries")
+                    
+                    # Show comprehensive summary every 300 frames
+                    if frame_index % 300 == 0:
+                        print(person_tracker.get_tracking_summary())
+
+    cap.release()
+    # Always close video writer since we always create it
+    video_writer.release()
+    
+    # Close display window if it was opened
+    if args.display:
+        cv2.destroyAllWindows()
+    
+    print(f"Output video saved to: {os.path.join(output_dir, 'output_with_detections.mp4')}")
+    
+    # Print final tracking statistics
+    if use_tracking:
+        print(person_tracker.get_tracking_summary())
+        final_stats = person_tracker.get_stats()
+        print(f"\n=== Final Tracking Statistics ===")
+        print(f"Total unique persons detected: {final_stats['next_id'] - 1}")
+        print(f"Active persons at end: {final_stats['active_persons']}")
+        print(f"Confirmed persons: {final_stats['confirmed_persons']}")
+        print(f"Successful recoveries: {final_stats['recovery_count']}")
         
-        return frame
+        # Calculate and display ID consistency metrics
+        recovery_rate = (final_stats['recovery_count'] / max(1, final_stats['total_tracks_created'])) * 100
+        print(f"ID Recovery Rate: {recovery_rate:.1f}%")
+        print(f"Tracking Quality: {'Excellent' if recovery_rate > 20 else 'Good' if recovery_rate > 10 else 'Improving'}")
     
-    # Process the video
-    video_processor.process_video(process_frame)
-    
-    print("Video processing complete. Exporting data...")
-    
-    # 3. Export all collected data
-    paths = data_processor.export_complete_dataset(pose_analyzer.gait_analyzer, args)
-    
-    # 4. Run ID merger if requested
-    if args.merge_ids:
-        print("\nStarting ID merging...")
-        merged_ids, id_to_name = data_processor.merge_ids(args, paths['flat_npy'])
-        
-        if merged_ids:
-            print(f"Successfully merged {len(merged_ids)} IDs")
-        if id_to_name:
-            print(f"Assigned names to {len(id_to_name)} unique persons")
-    
-    print("\n=== Processing Complete ===")
-    print(f"Results saved to: {args.results_dir}")
-    print(f"Main features: {paths['features_csv']}")
-    print(f"Enhanced features: {paths['invariants_csv']}")
-    
-    # Summary statistics
-    track_history = pose_analyzer.get_track_history()
-    valid_tracks = [tid for tid in track_history.keys() if tid > 0]
-    
-    print(f"\nSummary:")
-    print(f"- Total valid tracks: {len(valid_tracks)}")
-    print(f"- Track IDs: {sorted(valid_tracks)}")
-    
-    for track_id in sorted(valid_tracks):
-        frames_count = len(track_history[track_id])
-        gait_features = pose_analyzer.get_gait_features(track_id)
-        feature_count = len(gait_features) if gait_features else 0
-        print(f"  Track {track_id}: {frames_count} frames, {feature_count} features")
+    print(f"Video processing completed. Results saved to {csv_path}")
+    return 0
 
 if __name__ == "__main__":
     main()
