@@ -659,7 +659,7 @@ class ByteTracker:
                     print(f"Warning: Error in first stage matching: {e}")
                     matches_a = []
                     unmatched_dets_a = list(range(len(high_dets)))
-                    unmatched_tracks_a = confirmed_tracks.copy()
+                    unmatched_tracks_a = list(range(len(confirmed_tracks)))  # Fix: Return indices, not track objects
             if unconfirmed_tracks and unmatched_dets_a:
                 try:
                     # Only use remaining unmatched detections
@@ -877,7 +877,9 @@ class ByteTracker:
             'tentative_tracks': tentative,
             'next_id': self.next_id,
             'active_persons': confirmed,
-            'total_known_persons': self.next_id - 1  # For compatibility with existing code
+            'total_known_persons': self.next_id - 1,  # For compatibility with existing code
+            'recovery_count': len(self.recently_deleted),  # Track recovery stats
+            'total_tracks_created': self.next_id - 1  # Total number of unique tracks created
         }
 
 

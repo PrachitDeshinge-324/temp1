@@ -3,5 +3,5 @@ python main.py \
     --output_dir 'output' \
     --weights_dir '../Fresh/weights' \
     --transreid_weights '../Fresh/weights/transreid_vitbase.pth' \
-    --display
-    
+    --display \
+    --gait_analysis

@@ -4,7 +4,7 @@ import logging
 
 logging.getLogger("ultralytics").setLevel(logging.ERROR)
 
-def load_yolo_model(weights_dir: str, model_filename: str = "yolov8n.pt", device: str = "cpu"):
+def load_yolo_model(weights_dir: str, model_filename: str = "yolo11x.pt", device: str = "cpu"):
     model_path = os.path.join(weights_dir, model_filename)
     print(f"Trying to load model from: {model_path}")
     if not os.path.isfile(model_path):
@@ -20,7 +20,7 @@ def load_yolo_model(weights_dir: str, model_filename: str = "yolov8n.pt", device
         return None
 
 class PersonDetector:
-    def __init__(self, weights_dir: str, model_filename: str = "yolov8n.pt", device: str = "cpu"):
+    def __init__(self, weights_dir: str, model_filename: str = "yolo11x.pt", device: str = "cpu"):
         self.model = load_yolo_model(weights_dir, model_filename, device)
 
     def detect(self, frame):
@@ -36,7 +36,7 @@ class PersonDetector:
         return bboxes
     
 class PoseDetector:
-    def __init__(self, weights_dir: str, model_filename: str = "yolov8n-pose.pt", device: str = "cpu"):
+    def __init__(self, weights_dir: str, model_filename: str = "yolo11x-pose.pt", device: str = "cpu"):
         self.model = load_yolo_model(weights_dir, model_filename, device)
 
     def detect(self, frame):
@@ -51,7 +51,7 @@ class PoseDetector:
         return poses
     
 class ShiiloteDetector:
-    def __init__(self, weights_dir: str, model_filename: str = "yolov8n-shiilote.pt", device: str = "cpu"):
+    def __init__(self, weights_dir: str, model_filename: str = "yolo11x-seg.pt", device: str = "cpu"):
         self.model = load_yolo_model(weights_dir, model_filename, device)
 
     def detect(self, frame):
