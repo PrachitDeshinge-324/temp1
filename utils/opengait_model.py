@@ -7,9 +7,9 @@ from torchvision import transforms
 import yaml
 
 # Add OpenGait to path
-opengait_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'OpenGait')
-if opengait_path not in sys.path:
-    sys.path.insert(0, opengait_path)
+# opengait_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'OpenGait')
+# if opengait_path not in sys.path:
+#     sys.path.insert(0, opengait_path)
 
 # Import OpenGait modules directly
 try:
@@ -164,7 +164,7 @@ class OpenGaitModel:
                 else:
                     strides = [[1, 1], [2, 2], [2, 2], [1, 1]]
                     try:
-                        from opengait.modeling.modules import BasicBlock2D
+                        from OpenGait.opengait.modeling.modules import BasicBlock2D
                         block = BasicBlock2D
                     except ImportError:
                         # Fallback to P3D blocks if 2D blocks not available

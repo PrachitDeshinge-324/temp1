@@ -65,6 +65,7 @@ def get_arguments():
     parser.add_argument('--gait_gallery', type=str, default="gait_gallery.pkl", help='Path to gait embedding gallery')
     parser.add_argument('--gait_threshold', type=float, default=0.6, help='Threshold for gait matching (0.0-1.0)')
     parser.add_argument('--build_gallery', action='store_true', help='Build or update the gait embedding gallery')
+    parser.add_argument('--save_silhouettes', action='store_true', help='Save silhouette images during gait analysis')
     
     args = parser.parse_args()
     if not os.path.isfile(args.input):
@@ -334,9 +335,9 @@ def main():
                                     silhouette = cv2.morphologyEx(silhouette, cv2.MORPH_OPEN, kernel)
                                     
                                     # Save binary silhouette
-                                    sil_file = f"silhouette_{frame_index:06d}_id_{person_id:03d}.png"
-                                    sil_path = os.path.join(silhouette_dir, sil_file)
-                                    cv2.imwrite(sil_path, silhouette)
+                                    # sil_file = f"silhouette_{frame_index:06d}_id_{person_id:03d}.png"
+                                    # sil_path = os.path.join(silhouette_dir, sil_file)
+                                    # cv2.imwrite(sil_path, silhouette)
                                     
                                     # Standard height for gait analysis is often 128 pixels
                                     standard_height = 128
