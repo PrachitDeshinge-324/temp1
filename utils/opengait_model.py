@@ -260,21 +260,21 @@ class OpenGaitModel:
                 ipts, labs, typs, vies, seqL = inputs
                 
                 sils = ipts[0]
-                print(f"Input sils shape: {sils.shape}")
+                # print(f"Input sils shape: {sils.shape}")
                 
                 # Handle input format like DeepGaitV2
                 if len(sils.size()) == 4:
                     sils = sils.unsqueeze(1)  # [n, s, h, w] -> [n, 1, s, h, w]
-                    print(f"After unsqueeze: {sils.shape}")
+                    # print(f"After unsqueeze: {sils.shape}")
                 else:
                     from einops import rearrange
                     sils = rearrange(sils, 'n s c h w -> n c s h w')
-                    print(f"After rearrange: {sils.shape}")
+                    # print(f"After rearrange: {sils.shape}")
                 
                 # Forward through backbone
-                print(f"Before layer0: {sils.shape}")
+                # print(f"Before layer0: {sils.shape}")
                 outs = self.layer0(sils)
-                print(f"After layer0: {outs.shape}")
+                # print(f"After layer0: {outs.shape}")
                 
                 outs = self.layer1(outs)
                 outs = self.layer2(outs)

@@ -14,6 +14,98 @@ from utils.opengait_model import OpenGaitModel
 from utils.silhouette_processor import SilhouetteProcessor
 from utils.gait_gallery import GaitGallery
 
+def assess_silhouette_quality(silhouettes):
+    """
+    Assess the quality and completeness of a batch of silhouettes.
+    
+    Args:
+        silhouettes: List of silhouette images (numpy arrays)
+    
+    Returns:
+        dict: Quality metrics including completeness score, consistency, and coverage
+    """
+    if not silhouettes or len(silhouettes) == 0:
+        return {"completeness": 0.0, "consistency": 0.0, "coverage": 0.0, "is_complete": False}
+    
+    # Calculate pixel coverage metrics
+    coverage_scores = []
+    consistency_scores = []
+    
+    # Standard expected silhouette area (relative to image size)
+    expected_min_coverage = 0.15  # Minimum 15% of image should be person pixels
+    expected_max_coverage = 0.45  # Maximum 45% to avoid noise
+    
+    for silhouette in silhouettes:
+        if silhouette is None or silhouette.size == 0:
+            coverage_scores.append(0.0)
+            continue
+            
+        # Calculate pixel coverage
+        total_pixels = silhouette.shape[0] * silhouette.shape[1]
+        person_pixels = np.sum(silhouette > 128)  # Binary threshold
+        coverage_ratio = person_pixels / total_pixels
+        
+        # Score based on whether coverage is in expected range
+        if expected_min_coverage <= coverage_ratio <= expected_max_coverage:
+            coverage_score = 1.0
+        elif coverage_ratio < expected_min_coverage:
+            coverage_score = coverage_ratio / expected_min_coverage
+        else:
+            coverage_score = max(0.0, 1.0 - (coverage_ratio - expected_max_coverage) / 0.2)
+        
+        coverage_scores.append(coverage_score)
+    
+    # Calculate consistency between consecutive silhouettes
+    if len(silhouettes) > 1:
+        # Find common dimensions for all silhouettes
+        target_height = 128  # Standard height
+        target_width = 64   # Standard width for consistency
+        
+        for i in range(1, len(silhouettes)):
+            if silhouettes[i-1] is not None and silhouettes[i] is not None:
+                try:
+                    # Resize both silhouettes to same dimensions for comparison
+                    prev_sil = cv2.resize(silhouettes[i-1], (target_width, target_height))
+                    curr_sil = cv2.resize(silhouettes[i], (target_width, target_height))
+                    
+                    # Convert to float and normalize
+                    prev_sil = prev_sil.astype(np.float32) / 255.0
+                    curr_sil = curr_sil.astype(np.float32) / 255.0
+                    
+                    # Calculate overlap and size consistency
+                    intersection = np.sum((prev_sil > 0.5) & (curr_sil > 0.5))
+                    union = np.sum((prev_sil > 0.5) | (curr_sil > 0.5))
+                    
+                    if union > 0:
+                        iou = intersection / union
+                        consistency_scores.append(iou)
+                    else:
+                        consistency_scores.append(0.0)
+                except Exception as e:
+                    # Skip problematic silhouettes
+                    consistency_scores.append(0.0)
+    
+    # Calculate overall metrics
+    avg_coverage = np.mean(coverage_scores) if coverage_scores else 0.0
+    avg_consistency = np.mean(consistency_scores) if consistency_scores else 0.0
+    
+    # Completeness combines coverage quality and temporal consistency
+    completeness = (avg_coverage * 0.7 + avg_consistency * 0.3)
+    
+    # Determine if this is a "complete" dataset
+    is_complete = (completeness >= 0.85 and 
+                   len(silhouettes) >= 30 and 
+                   avg_coverage >= 0.8)
+    
+    return {
+        "completeness": completeness,
+        "consistency": avg_consistency,
+        "coverage": avg_coverage,
+        "is_complete": is_complete,
+        "frame_count": len(silhouettes),
+        "valid_frames": len([s for s in coverage_scores if s > 0.1])
+    }
+
 def create_gait_energy_image(silhouettes, output_path):
     """
     Create a Gait Energy Image (GEI) from a sequence of silhouettes.
@@ -222,6 +314,23 @@ def main():
     # Store silhouettes for gait analysis
     person_silhouettes = {}
     
+    # Optimized embedding management variables 
+    track_frame_buffer = {}      # person_id -> list of silhouettes (buffering ~100 frames)
+    track_embeddings = {}        # person_id -> final aggregated embedding
+    track_last_processed = {}    # person_id -> frame when last processed
+    track_processed_count = {}   # person_id -> number of times processed
+    embedding_batch_size = 100   # Target frames to collect before processing
+    min_frames_for_embedding = 30  # Minimum frames needed for embedding generation
+    min_frames_between_updates = 50  # Minimum frames between re-processing same track
+    
+    # Enhanced dataset quality tracking for periodic updates
+    track_silhouette_quality = {}    # person_id -> dict with quality metrics
+    track_completeness_history = {}  # person_id -> list of completeness scores per batch
+    track_last_complete_batch = {}   # person_id -> frame index of last complete batch
+    dataset_quality_threshold = 0.85  # Minimum completeness score for "complete" dataset
+    periodic_update_interval = 300    # Frames between periodic quality assessments
+    min_batches_for_comparison = 2    # Minimum batches needed before quality comparison
+    
     csv_path = os.path.join(output_dir, "detections.csv")
     with open(csv_path, mode='w', newline='') as csvfile:
         writer = csv.writer(csvfile)
@@ -362,14 +471,8 @@ def main():
                                     if person_id not in person_silhouettes:
                                         person_silhouettes[person_id] = []
                                         
-                                    # Store normalized silhouette for GEI generation
-                                    # We always collect silhouettes to ensure we have enough for analysis
+                                    # Store normalized silhouette for this frame 
                                     person_silhouettes[person_id].append(normalized_silhouette)
-                                    
-                                    # Limit the number of stored silhouettes to prevent memory issues
-                                    # Keep only the most recent 60 frames (arbitrary limit that can be adjusted)
-                                    if len(person_silhouettes[person_id]) > 60:
-                                        person_silhouettes[person_id] = person_silhouettes[person_id][-60:]
                             else:
                                 if args.save_crops:
                                     # No mask found, save original crop
@@ -446,78 +549,195 @@ def main():
                             # Save to CSV with segmentation file info
                             seg_file = segmentation_files[idx] if idx < len(segmentation_files) else ""
                             writer.writerow([frame_index, person_id, x1, y1, x2, y2, confidence, seg_file])
-                        
-                            # Add these variables at the beginning of main()
-                            track_last_processed = {}  # Frame when track was last processed
-                            track_processed_count = {}  # How many times each track has been processed
-                            min_frames_between_updates = 30  # Minimum frames between updates for same track
-
-                            # Then modify the gait analysis section:
-                            if args.gait_analysis and opengait_model:
-                                try:
-                                    for person_id in person_silhouettes:
-                                        # Check if we have enough silhouettes
-                                        if len(person_silhouettes[person_id]) >= 10:
-                                            # Only process this track if:
-                                            # 1. We've never processed it before, OR
-                                            # 2. It's been enough frames since last update, OR
-                                            # 3. We've only processed it a few times (better embeddings with more data)
-                                            should_process = (
-                                                person_id not in track_last_processed or
-                                                (frame_index - track_last_processed[person_id]) > min_frames_between_updates or
-                                                (person_id in track_processed_count and track_processed_count[person_id] < 3)
-                                            )
-                                            
-                                            if should_process:
-                                                # Process sequence for OpenGait
-                                                sequence = silhouette_processor.prepare_sequence(person_silhouettes[person_id])
-                                                
-                                                # Extract gait embedding
-                                                gait_embedding = opengait_model.extract_embeddings(sequence)
-                                                
-                                                # Update processing history
-                                                track_last_processed[person_id] = frame_index
-                                                if person_id not in track_processed_count:
-                                                    track_processed_count[person_id] = 1
-                                                else:
-                                                    track_processed_count[person_id] += 1
-                                                
-                                                # Only proceed if we got valid embeddings
-                                                if gait_embedding is not None and gait_gallery:
-                                                    # Ensure track_to_identity exists
-                                                    if not hasattr(gait_gallery, 'track_to_identity'):
-                                                        gait_gallery.track_to_identity = {}
-                                                    
-                                                    # Check if this track already has an identity
-                                                    if person_id in gait_gallery.track_to_identity:
-                                                        # UPDATE existing identity with improved embedding
-                                                        identity_id = gait_gallery.track_to_identity[person_id]
-                                                        gait_gallery.update_embedding(identity_id, gait_embedding)
-                                                        print(f"Updated embedding for Track {person_id} → Identity {identity_id}")
-                                                    else:
-                                                        # This is a new track - match or assign identity
-                                                        identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
-                                                            gait_embedding, 
-                                                            threshold=args.gait_threshold,
-                                                            force_new=(frame_index < 200)
-                                                        )
-                                                        
-                                                        if is_new:
-                                                            print(f"New identity created: Track {person_id} → Identity {identity_id}")
-                                                        else:
-                                                            print(f"Gait match found: Track {person_id} → Identity {identity_id} (confidence: {confidence:.2f})")
-                                                        
-                                                        # Map track ID to identity ID
-                                                        gait_gallery.track_to_identity[person_id] = identity_id
-                                                        
-                                                    # Save gallery after processing
-                                                    if frame_index % 100 == 0:
-                                                        gait_gallery.save_gallery()
-                                except Exception as e:
-                                    print(f"Error in gait analysis: {e}")
                                     
                         # Write frame to output video
                         video_writer.write(output_frame)
+                        
+                        # Optimized gait analysis with batch processing (after all detections processed)
+                        if args.gait_analysis and opengait_model and person_silhouettes:
+                            try:
+                                # Process silhouettes for embedding generation
+                                for person_id in person_silhouettes:
+                                    # Initialize frame buffer for this person if not exists
+                                    if person_id not in track_frame_buffer:
+                                        track_frame_buffer[person_id] = []
+                                    
+                                    # Add current silhouettes to buffer (only new ones from this frame)
+                                    current_silhouettes = person_silhouettes[person_id]
+                                    if current_silhouettes:
+                                        track_frame_buffer[person_id].extend(current_silhouettes)
+                                        
+                                        # Limit buffer size to prevent memory issues
+                                        if len(track_frame_buffer[person_id]) > embedding_batch_size * 2:
+                                            track_frame_buffer[person_id] = track_frame_buffer[person_id][-embedding_batch_size:]
+                                    
+                                    # Check if we should process this track for embedding generation
+                                    buffer_size = len(track_frame_buffer[person_id])
+                                    
+                                    should_process = False
+                                    process_reason = ""
+                                    
+                                    # Condition 1: Enough frames for first-time processing
+                                    if person_id not in track_embeddings and buffer_size >= min_frames_for_embedding:
+                                        should_process = True
+                                        process_reason = "initial_processing"
+                                    
+                                    # Condition 2: Batch size reached for embedding update  
+                                    elif buffer_size >= embedding_batch_size:
+                                        # Check if enough time has passed since last processing
+                                        if (person_id not in track_last_processed or 
+                                            (frame_index - track_last_processed[person_id]) >= min_frames_between_updates):
+                                            should_process = True
+                                            process_reason = "batch_update"
+                                    
+                                    # Condition 3: Clear gallery mode - process tracks with sufficient data
+                                    elif args.clear_gallery and buffer_size >= min_frames_for_embedding:
+                                        should_process = True
+                                        process_reason = "clear_gallery_mode"
+                                    
+                                    if should_process:
+                                        print(f"Processing embedding for Track {person_id}: {process_reason} ({buffer_size} frames)")
+                                        
+                                        # Assess quality of current batch before processing
+                                        current_quality = assess_silhouette_quality(track_frame_buffer[person_id])
+                                        
+                                        # Initialize quality tracking for this person
+                                        if person_id not in track_silhouette_quality:
+                                            track_silhouette_quality[person_id] = {
+                                                "best_quality": current_quality,
+                                                "current_quality": current_quality,
+                                                "last_assessment": frame_index
+                                            }
+                                        
+                                        if person_id not in track_completeness_history:
+                                            track_completeness_history[person_id] = []
+                                        
+                                        # Add current quality to history
+                                        track_completeness_history[person_id].append({
+                                            "frame": frame_index,
+                                            "quality": current_quality,
+                                            "batch_size": buffer_size
+                                        })
+                                        
+                                        # Determine if we should update based on dataset completeness
+                                        should_update_embedding = False
+                                        update_reason = ""
+                                        
+                                        # Check if this is first processing or a superior complete dataset
+                                        if person_id not in track_embeddings:
+                                            should_update_embedding = True
+                                            update_reason = "initial_embedding"
+                                        else:
+                                            # Compare with previous best quality
+                                            prev_best = track_silhouette_quality[person_id]["best_quality"]
+                                            
+                                            # Update if current dataset is significantly more complete
+                                            if current_quality["is_complete"] and not prev_best["is_complete"]:
+                                                should_update_embedding = True
+                                                update_reason = "first_complete_dataset"
+                                            elif (current_quality["is_complete"] and prev_best["is_complete"] and 
+                                                  current_quality["completeness"] > prev_best["completeness"] + 0.05):
+                                                should_update_embedding = True
+                                                update_reason = "superior_complete_dataset"
+                                            elif (frame_index - track_silhouette_quality[person_id]["last_assessment"] >= periodic_update_interval and
+                                                  current_quality["completeness"] > prev_best["completeness"] + 0.1):
+                                                should_update_embedding = True
+                                                update_reason = "periodic_quality_improvement"
+                                        
+                                        if should_update_embedding:
+                                            print(f"  → Quality Assessment: {update_reason}")
+                                            print(f"  → Completeness: {current_quality['completeness']:.3f}, Coverage: {current_quality['coverage']:.3f}")
+                                            print(f"  → Is Complete: {current_quality['is_complete']}, Valid Frames: {current_quality['valid_frames']}/{current_quality['frame_count']}")
+                                            
+                                            # Prepare sequence for OpenGait (use all buffered frames)
+                                            sequence = silhouette_processor.prepare_sequence(track_frame_buffer[person_id])
+                                            
+                                            # Extract gait embedding (single processing per batch)
+                                            gait_embedding = opengait_model.extract_embeddings(sequence)
+                                            
+                                            if gait_embedding is not None:
+                                                # Store the final aggregated embedding (no per-frame writes)
+                                                track_embeddings[person_id] = gait_embedding
+                                                
+                                                # Update quality tracking with successful processing
+                                                track_silhouette_quality[person_id]["current_quality"] = current_quality
+                                                if current_quality["completeness"] > track_silhouette_quality[person_id]["best_quality"]["completeness"]:
+                                                    track_silhouette_quality[person_id]["best_quality"] = current_quality
+                                                    track_last_complete_batch[person_id] = frame_index
+                                                track_silhouette_quality[person_id]["last_assessment"] = frame_index
+                                                
+                                                # Update processing history
+                                                track_last_processed[person_id] = frame_index
+                                                track_processed_count[person_id] = track_processed_count.get(person_id, 0) + 1
+                                                
+                                                # Database operations - conditional updates only for complete datasets
+                                                if gait_gallery:
+                                                    # Ensure track_to_identity mapping exists
+                                                    if not hasattr(gait_gallery, 'track_to_identity'):
+                                                        gait_gallery.track_to_identity = {}
+                                                    
+                                                    # Check if this track already has an identity (conditional update)
+                                                    if person_id in gait_gallery.track_to_identity:
+                                                        identity_id = gait_gallery.track_to_identity[person_id] 
+                                                        
+                                                        # Only update if we have a complete dataset or significant improvement
+                                                        if (current_quality["is_complete"] or 
+                                                            update_reason in ["superior_complete_dataset", "periodic_quality_improvement"]):
+                                                            # Use higher weight for complete datasets
+                                                            update_weight = 0.5 if current_quality["is_complete"] else 0.3
+                                                            update_success = gait_gallery.update_embedding(identity_id, gait_embedding, weight=update_weight)
+                                                            if update_success:
+                                                                print(f"  → Updated embedding for Track {person_id} → Identity {identity_id} (weight: {update_weight})")
+                                                    else:
+                                                        # New track - match or assign identity (single database write)
+                                                        identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
+                                                            gait_embedding,
+                                                            threshold=args.gait_threshold,
+                                                            force_new=args.clear_gallery or (frame_index < 200)
+                                                        )
+                                                        
+                                                        if is_new:
+                                                            print(f"  → New identity created: Track {person_id} → Identity {identity_id}")
+                                                        else:
+                                                            print(f"  → Gait match found: Track {person_id} → Identity {identity_id} (confidence: {confidence:.2f})")
+                                                        
+                                                        # Map track ID to identity ID (single mapping write)
+                                                        gait_gallery.track_to_identity[person_id] = identity_id
+                                                
+                                                # Clear processed frames from buffer to save memory (keep overlap for complete datasets)
+                                                if process_reason == "batch_update":
+                                                    # Keep larger overlap for high-quality datasets
+                                                    overlap_size = min(30 if current_quality["is_complete"] else 20, 
+                                                                     len(track_frame_buffer[person_id]) // 4)
+                                                    track_frame_buffer[person_id] = track_frame_buffer[person_id][-overlap_size:] if overlap_size > 0 else []
+                                            else:
+                                                print(f"  → Warning: Failed to extract embedding for Track {person_id}")
+                                        else:
+                                            print(f"  → Quality insufficient for update: completeness={current_quality['completeness']:.3f}, is_complete={current_quality['is_complete']}")
+                                            print(f"  → Reason: {current_quality['completeness']:.3f} vs best {track_silhouette_quality[person_id]['best_quality']['completeness']:.3f}")
+                                
+                                # Clear silhouettes for next frame to avoid duplication
+                                person_silhouettes.clear()
+                                
+                                # Periodic gallery save (reduce I/O frequency)
+                                if frame_index % 200 == 0 and gait_gallery:
+                                    gait_gallery.save_gallery()
+                                    print(f"Gallery saved at frame {frame_index}")
+                                
+                                # Periodic quality monitoring (every 300 frames)
+                                if frame_index % periodic_update_interval == 0:
+                                    print(f"\n=== Periodic Quality Assessment at Frame {frame_index} ===")
+                                    for person_id in track_frame_buffer:
+                                        if len(track_frame_buffer[person_id]) >= 20:  # Only assess if enough frames
+                                            current_quality = assess_silhouette_quality(track_frame_buffer[person_id])
+                                            print(f"  Track {person_id}: {len(track_frame_buffer[person_id])} frames, "
+                                                  f"completeness={current_quality['completeness']:.3f}, "
+                                                  f"complete={current_quality['is_complete']}")
+                                    
+                            except Exception as e:
+                                print(f"Error in optimized gait analysis: {e}")
+                                import traceback
+                                traceback.print_exc()
                         
                         # Display frame if requested
                         if args.display:
@@ -569,9 +789,9 @@ def main():
         gait_gallery.save_gallery()
 
     # Create Gait Energy Images (GEI) for each person if gait analysis is enabled
-    if args.gait_analysis and person_silhouettes:
+    if args.gait_analysis and track_frame_buffer:
         print("\nGenerating Gait Energy Images (GEI) for each person...")
-        for person_id, silhouettes in person_silhouettes.items():
+        for person_id, silhouettes in track_frame_buffer.items():
             if len(silhouettes) >= 10:  # Only create GEI if we have enough frames
                 gei_path = os.path.join(gait_dir, f"gei_person_{person_id:03d}.png")
                 create_gait_energy_image(silhouettes, gei_path)
@@ -614,8 +834,68 @@ def main():
     print(f"Output video saved to: {output_video_path}")
     if args.save_crops:
         print(f"Segmented person crops saved to: {seg_crops_dir}")
+    
     print(f"\n=== Final Tracking Statistics ===")
     print(f"Total unique persons detected: {len(track_history)}")
+    
+    # Print optimized embedding statistics
+    if args.gait_analysis and opengait_model:
+        print(f"\n=== Optimized Embedding Management Statistics ===")
+        print(f"Tracks with embeddings generated: {len(track_embeddings)}")
+        total_processing_runs = sum(track_processed_count.values()) if track_processed_count else 0
+        print(f"Total embedding processing runs: {total_processing_runs}")
+        if track_processed_count:
+            avg_processing = total_processing_runs / len(track_processed_count)
+            print(f"Average processing runs per track: {avg_processing:.1f}")
+        
+        # Show buffer statistics
+        total_buffered_frames = sum(len(buffer) for buffer in track_frame_buffer.values())
+        print(f"Total frames buffered: {total_buffered_frames}")
+        if track_frame_buffer:
+            avg_buffer_size = total_buffered_frames / len(track_frame_buffer)
+            print(f"Average buffer size per track: {avg_buffer_size:.1f} frames")
+        
+        # Enhanced quality and completeness statistics
+        if track_silhouette_quality:
+            print(f"\n=== Dataset Quality Assessment Results ===")
+            complete_datasets = 0
+            total_completeness = 0
+            total_coverage = 0
+            
+            for person_id, quality_info in track_silhouette_quality.items():
+                best_quality = quality_info["best_quality"]
+                current_quality = quality_info["current_quality"]
+                
+                if best_quality["is_complete"]:
+                    complete_datasets += 1
+                
+                total_completeness += best_quality["completeness"]
+                total_coverage += best_quality["coverage"]
+                
+                # Report quality for each track
+                print(f"  Track {person_id}: Completeness={best_quality['completeness']:.3f}, "
+                      f"Coverage={best_quality['coverage']:.3f}, Complete={best_quality['is_complete']}")
+            
+            print(f"Tracks with complete datasets: {complete_datasets}/{len(track_silhouette_quality)}")
+            if track_silhouette_quality:
+                avg_completeness = total_completeness / len(track_silhouette_quality)
+                avg_coverage = total_coverage / len(track_silhouette_quality)
+                print(f"Average dataset completeness: {avg_completeness:.3f}")
+                print(f"Average silhouette coverage: {avg_coverage:.3f}")
+        
+        # Show database efficiency
+        if gait_gallery and hasattr(gait_gallery, 'track_to_identity'):
+            print(f"\n=== Gallery Update Statistics ===")
+            print(f"Gallery identities created: {len(set(gait_gallery.track_to_identity.values()))}")
+            print(f"Track-to-identity mappings: {len(gait_gallery.track_to_identity)}")
+            
+            # Show periodic update statistics
+            if track_last_complete_batch:
+                print(f"Tracks with complete batch updates: {len(track_last_complete_batch)}")
+                recent_complete_updates = sum(1 for frame_idx in track_last_complete_batch.values() 
+                                            if frame_index - frame_idx <= periodic_update_interval)
+                print(f"Recent complete updates (last {periodic_update_interval} frames): {recent_complete_updates}")
+    
     print(f"Video processing completed. Results saved to {csv_path}")
     return 0
 

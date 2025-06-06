@@ -16,3 +16,6 @@ python main.py \
     --opengait_config "OpenGait/configs/deepgaitv2/DeepGaitV2_sustech1k.yaml"\
     --opengait_weights 'DeepGaitV2_30_DA-50000.pt' \
     --build_gallery
+
+find . -type d -name "__pycache__" -exec rm -rf {} +
+find . -type d -name ".cache" -exec rm -rf {} +
