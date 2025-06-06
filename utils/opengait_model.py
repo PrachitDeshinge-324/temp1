@@ -419,7 +419,7 @@ class OpenGaitModel:
                 
                 # Apply temperature scaling to increase discrimination between identities
                 # Lower temperature increases separation between embeddings
-                temperature = 0.03
+                temperature = 0.01
                 embedding = embedding / temperature
                 
                 return embedding.cpu()

@@ -24,30 +24,67 @@ class GaitGallery:
                 except:
                     pass  # Keep default if something goes wrong
     
-    def get_or_assign_identity(self, query_embedding, threshold=0.95):
+    def get_or_assign_identity(self, query_embedding, threshold=0.98, force_new=False, frame_index=0):
         """
         Match against gallery or assign new identity if no match found
         
         Args:
             query_embedding: The embedding to match
             threshold: Similarity threshold for matching (higher = stricter)
+            force_new: Force creation of a new identity regardless of matches
+            frame_index: Current frame index for adaptive thresholding
                 
         Returns:
             tuple: (person_id, confidence, is_new_identity)
         """
-        # First try to find a match in existing gallery
+        # Always assign new identities during gallery building phase or if forced
+        if force_new:
+            new_id = str(self.next_id)
+            self.next_id += 1
+            self.gallery[new_id] = [query_embedding]  # Store as a list with one embedding
+            return new_id, 0.0, True
+            
+        # Find match in existing gallery
         match_id, confidence = self.find_match(query_embedding, threshold)
         
         if match_id is not None:
-            # Add this embedding to the matched identity to improve future matching
-            self.add_embedding(match_id, query_embedding)
+            # Don't add multiple embeddings, just replace the existing one
+            # This ensures one embedding per identity
+            self.gallery[match_id] = [query_embedding]  # Replace with latest
             return match_id, confidence, False
         else:
-            # No match found, assign new identity and add to gallery
+            # No match found, assign new identity
             new_id = str(self.next_id)
             self.next_id += 1
-            self.add_embedding(new_id, query_embedding)
-            return new_id, 0.0, True  # Confidence 0 since this is a new identity
+            self.gallery[new_id] = [query_embedding]  # Store as a list with one embedding
+            return new_id, 0.0, True
+
+    def update_embedding(self, identity_id, new_embedding, weight=0.3):
+        """
+        Update an identity's embedding with a new one using weighted average
+        
+        Args:
+            identity_id: Identity ID to update
+            new_embedding: New embedding tensor
+            weight: Weight for new embedding (0-1)
+        """
+        if identity_id in self.gallery and self.gallery[identity_id]:
+            # Get current aggregated embedding
+            current = self.get_aggregated_embedding(identity_id)
+            
+            if current is not None:
+                # Perform weighted average update
+                updated = (1-weight) * current + weight * new_embedding
+                
+                # Replace with normalized version
+                import torch.nn.functional as F
+                updated = F.normalize(updated, p=2, dim=0)
+                
+                # Store as the new embedding
+                self.gallery[identity_id] = [updated]
+                return True
+        
+        return False
 
     def gallery_stats(self):
         """Get statistics about the gallery"""
