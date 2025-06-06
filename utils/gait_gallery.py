@@ -10,10 +10,45 @@ class GaitGallery:
         """Initialize gait embedding gallery"""
         self.gallery = {}  # person_id -> list of embeddings
         self.gallery_path = gallery_path
+        self.next_id = 1  # For assigning new unique IDs to unmatched people
+        self.track_to_identity = {}  # Initialize the mapping attribute
         
         if gallery_path and os.path.exists(gallery_path):
             self.load_gallery(gallery_path)
-            
+            # Set next_id to be one more than the highest ID in the gallery
+            if self.gallery:
+                try:
+                    numeric_ids = [int(id) for id in self.gallery.keys() if str(id).isdigit()]
+                    if numeric_ids:
+                        self.next_id = max(numeric_ids) + 1
+                except:
+                    pass  # Keep default if something goes wrong
+    
+    def get_or_assign_identity(self, query_embedding, threshold=0.95):
+        """
+        Match against gallery or assign new identity if no match found
+        
+        Args:
+            query_embedding: The embedding to match
+            threshold: Similarity threshold for matching (higher = stricter)
+                
+        Returns:
+            tuple: (person_id, confidence, is_new_identity)
+        """
+        # First try to find a match in existing gallery
+        match_id, confidence = self.find_match(query_embedding, threshold)
+        
+        if match_id is not None:
+            # Add this embedding to the matched identity to improve future matching
+            self.add_embedding(match_id, query_embedding)
+            return match_id, confidence, False
+        else:
+            # No match found, assign new identity and add to gallery
+            new_id = str(self.next_id)
+            self.next_id += 1
+            self.add_embedding(new_id, query_embedding)
+            return new_id, 0.0, True  # Confidence 0 since this is a new identity
+
     def gallery_stats(self):
         """Get statistics about the gallery"""
         stats = {
@@ -136,60 +171,35 @@ class GaitGallery:
             import traceback
             traceback.print_exc()
             return None, 0.0
-    
-    def save_gallery(self, path=None):
-        """Save gallery to disk"""
-        try:
-            save_path = path or self.gallery_path
-            if not save_path:
-                print("Warning: No gallery path specified for saving")
-                return False
+
+    def save_gallery(self):
+        """Save gallery to file"""
+        if self.gallery_path:
+            try:
+                # Save the entire object, not just the gallery dict
+                with open(self.gallery_path, 'wb') as f:
+                    pickle.dump(self, f)
+                print(f"Gallery saved successfully to {self.gallery_path}")
+                print(f"Gallery contains {len(self.gallery)} identities")
+                return True
+            except Exception as e:
+                print(f"Error saving gallery: {e}")
+        return False
+
+    def load_gallery(self, gallery_path):
+        """Load gallery from file"""
+        if os.path.exists(gallery_path):
+            try:
+                with open(gallery_path, 'rb') as f:
+                    loaded_obj = pickle.load(f)
+                    
+                # Copy all attributes from loaded object
+                self.gallery = loaded_obj.gallery
+                self.next_id = getattr(loaded_obj, 'next_id', 1)
+                self.track_to_identity = getattr(loaded_obj, 'track_to_identity', {})
                 
-            # Create directory if it doesn't exist
-            os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
-            
-            # Save the gallery
-            with open(save_path, 'wb') as f:
-                pickle.dump(self.gallery, f)
-                
-            print(f"Gallery saved successfully to {save_path}")
-            print(f"Gallery contains {len(self.gallery)} identities")
-            return True
-        except Exception as e:
-            print(f"Error saving gallery: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def load_gallery(self, path=None):
-        """Load gallery from disk"""
-        try:
-            load_path = path or self.gallery_path
-            if not load_path:
-                print("Warning: No gallery path specified for loading")
-                return False
-                
-            if not os.path.exists(load_path):
-                print(f"Warning: Gallery file not found at {load_path}")
-                return False
-                
-            # Load the gallery
-            with open(load_path, 'rb') as f:
-                loaded_gallery = pickle.load(f)
-                
-            # Validate loaded data
-            if not isinstance(loaded_gallery, dict):
-                print(f"Error: Invalid gallery format in {load_path}")
-                return False
-                
-            # Update the gallery
-            self.gallery = loaded_gallery
-            
-            print(f"Gallery loaded successfully from {load_path}")
-            print(f"Gallery contains {len(self.gallery)} identities")
-            return True
-        except Exception as e:
-            print(f"Error loading gallery: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+                print(f"Loaded gallery from {gallery_path} with {len(self.gallery)} identities")
+                return True
+            except Exception as e:
+                print(f"Error loading gallery: {e}")
+        return False

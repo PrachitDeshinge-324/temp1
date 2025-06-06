@@ -413,6 +413,15 @@ class OpenGaitModel:
                 # Get first (and only) sample from batch
                 embedding = embeddings[0]  # [c]
                 
+                # Apply L2 normalization for better cosine similarity measurement
+                import torch.nn.functional as F
+                embedding = F.normalize(embedding, p=2, dim=0)
+                
+                # Apply temperature scaling to increase discrimination between identities
+                # Lower temperature increases separation between embeddings
+                temperature = 0.03
+                embedding = embedding / temperature
+                
                 return embedding.cpu()
             else:
                 print("Warning: Could not extract embeddings from model output")
@@ -423,7 +432,7 @@ class OpenGaitModel:
             import traceback
             traceback.print_exc()
             return None
-    
+
     def compute_similarity(self, embedding1, embedding2):
         """
         Compute cosine similarity between two embeddings

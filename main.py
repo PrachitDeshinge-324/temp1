@@ -63,9 +63,13 @@ def get_arguments():
     parser.add_argument('--opengait_weights', type=str, default="", help='Path to OpenGait model weights')
     parser.add_argument('--opengait_config', type=str, default="OpenGait/configs/default.yaml", help='Path to OpenGait model configuration')
     parser.add_argument('--gait_gallery', type=str, default="gait_gallery.pkl", help='Path to gait embedding gallery')
-    parser.add_argument('--gait_threshold', type=float, default=0.6, help='Threshold for gait matching (0.0-1.0)')
+    parser.add_argument('--gait_threshold', type=float, default=0.95, help='Threshold for gait matching (0.0-1.0)')
     parser.add_argument('--build_gallery', action='store_true', help='Build or update the gait embedding gallery')
     parser.add_argument('--save_silhouettes', action='store_true', help='Save silhouette images during gait analysis')
+    parser.add_argument('--force_new_identities', action='store_true',
+                        help='Force creation of new identities even with matches')
+    parser.add_argument('--clear_gallery', action='store_true',
+                        help='Clear existing gallery and start fresh')
     
     args = parser.parse_args()
     if not os.path.isfile(args.input):
@@ -173,6 +177,11 @@ def main():
             # Initialize gait gallery
             gait_gallery = GaitGallery(args.gait_gallery)
             
+            # Clear gallery if requested
+            if args.clear_gallery and gait_gallery:
+                print("Clearing existing gallery as requested...")
+                gait_gallery.gallery = {}
+                gait_gallery.next_id = 1
             # Print gallery statistics
             if gait_gallery and hasattr(gait_gallery, 'gallery_stats'):
                 stats = gait_gallery.gallery_stats()
@@ -380,8 +389,13 @@ def main():
                             # Get color for this person ID
                             color = person_colors[person_id % len(person_colors)]
                             
-                            # Draw bounding box and person ID
-                            draw_person_detection(output_frame, (x1, y1, x2, y2), person_id, color)
+                            # Get identity ID if available from gait gallery
+                            identity_id = None
+                            if gait_gallery and hasattr(gait_gallery, 'track_to_identity') and person_id in gait_gallery.track_to_identity:
+                                identity_id = gait_gallery.track_to_identity[person_id]
+                            
+                            # Draw bounding box and person ID with identity information
+                            draw_person_detection(output_frame, (x1, y1, x2, y2), person_id, color, identity_id=identity_id)
                             
                             # Draw track history
                             if person_id in track_history:
@@ -432,32 +446,39 @@ def main():
                         # Integrate gait analysis in the frame processing loop
                         if args.gait_analysis and opengait_model:
                             try:
-                                # Check if person_id exists in the dictionary and has enough silhouettes
-                                if person_id in person_silhouettes and len(person_silhouettes[person_id]) >= 10:
-                                    # Process sequence for OpenGait
-                                    sequence = silhouette_processor.prepare_sequence(person_silhouettes[person_id])
-                                    
-                                    # Extract gait embedding
-                                    gait_embedding = opengait_model.extract_embeddings(sequence)
-                                    
-                                    # Only proceed if we got valid embeddings
-                                    if gait_embedding is not None:
-                                        # In training/gallery building mode, add to gallery
-                                        if args.build_gallery:
-                                            gait_gallery.add_embedding(person_id, gait_embedding)
-                                            print(f"Added embedding for ID {person_id} to gallery")
+                                for person_id in person_silhouettes:
+                                    if len(person_silhouettes[person_id]) >= 10:
+                                        # Process sequence for OpenGait
+                                        sequence = silhouette_processor.prepare_sequence(person_silhouettes[person_id])
                                         
-                                        # In identification mode, match against gallery only if it has entries
-                                        elif gait_gallery and len(gait_gallery.gallery) > 0:
-                                            match_id, confidence = gait_gallery.find_match(gait_embedding, args.gait_threshold)
-                                            if match_id is not None:
-                                                print(f"Gait match found: Track {person_id} → Identity {match_id} (confidence: {confidence:.2f})")
-                                    else:
-                                        print(f"Warning: Could not extract embeddings for track {person_id}")
+                                        # Extract gait embedding
+                                        gait_embedding = opengait_model.extract_embeddings(sequence)
+                                        
+                                        # Only proceed if we got valid embeddings
+                                        if gait_embedding is not None and gait_gallery:
+                                            # Ensure track_to_identity exists
+                                            if not hasattr(gait_gallery, 'track_to_identity'):
+                                                gait_gallery.track_to_identity = {}
+                                            
+                                            # Match or assign identity from gallery
+                                            identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
+                                                gait_embedding, 
+                                                threshold=args.gait_threshold
+                                            )
+                                            
+                                            if is_new:
+                                                print(f"New identity created: Track {person_id} → Identity {identity_id}")
+                                            else:
+                                                print(f"Gait match found: Track {person_id} → Identity {identity_id} (confidence: {confidence:.2f})")
+                                            
+                                            # Map track ID to identity ID
+                                            gait_gallery.track_to_identity[person_id] = identity_id
+                                            
+                                            # Save gallery periodically
+                                            if is_new or frame_index % 100 == 0:
+                                                gait_gallery.save_gallery()
                             except Exception as e:
-                                print(f"Error in gait analysis for track {person_id}: {e}")
-                                import traceback
-                                traceback.print_exc()
+                                print(f"Error in gait analysis: {e}")                        
 
                         # Write frame to output video
                         video_writer.write(output_frame)

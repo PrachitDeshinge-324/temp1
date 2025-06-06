@@ -12,16 +12,17 @@ def generate_colors(num_colors):
         colors.append((int(color[0]), int(color[1]), int(color[2])))
     return colors
 
-def draw_person_detection(frame, bbox, person_id, color=(0, 255, 0), thickness=2):
+def draw_person_detection(frame, bbox, person_id, color=(0, 255, 0), thickness=2, identity_id=None):
     """
     Draw bounding box and person ID on the frame
     
     Args:
         frame: Input frame
         bbox: Bounding box coordinates [x1, y1, x2, y2]
-        person_id: Person ID to display
+        person_id: Person ID to display (tracking ID)
         color: Color for the bounding box and text
         thickness: Line thickness for bounding box
+        identity_id: Optional persistent identity ID from gait analysis
     
     Returns:
         Frame with annotations
@@ -31,8 +32,12 @@ def draw_person_detection(frame, bbox, person_id, color=(0, 255, 0), thickness=2
     # Draw bounding box
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
     
-    # Prepare text
-    text = f"Person {person_id}"
+    # Prepare text - show identity if available, otherwise just show tracking ID
+    if identity_id is not None:
+        text = f"ID:{identity_id} (T{person_id})"
+    else:
+        text = f"Track {person_id}"
+    
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.6
     text_thickness = 2
