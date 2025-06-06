@@ -10,6 +10,9 @@ from utils.helper import get_best_device
 from utils.transreid import TransReIDModel
 from utils.visualize import draw_person_detection, generate_colors, create_video_writer
 from utils.reid_tracker import ReIDEnhancedTracker
+from utils.opengait_model import OpenGaitModel
+from utils.silhouette_processor import SilhouetteProcessor
+from utils.gait_gallery import GaitGallery
 
 def create_gait_energy_image(silhouettes, output_path):
     """
@@ -57,6 +60,12 @@ def get_arguments():
     parser.add_argument('--save_crops', action='store_true', help='Save segmented person crops')
     parser.add_argument('--gait_analysis', action='store_true', help='Generate gait analysis data')
     parser.add_argument('--reid_similarity', type=float, default=0.7, help='Similarity threshold for ReID (0.0-1.0)')
+    parser.add_argument('--opengait_weights', type=str, default="", help='Path to OpenGait model weights')
+    parser.add_argument('--opengait_config', type=str, default="OpenGait/configs/default.yaml", help='Path to OpenGait model configuration')
+    parser.add_argument('--gait_gallery', type=str, default="gait_gallery.pkl", help='Path to gait embedding gallery')
+    parser.add_argument('--gait_threshold', type=float, default=0.6, help='Threshold for gait matching (0.0-1.0)')
+    parser.add_argument('--build_gallery', action='store_true', help='Build or update the gait embedding gallery')
+    
     args = parser.parse_args()
     if not os.path.isfile(args.input):
         raise FileNotFoundError(f"Input file {args.input} does not exist.")
@@ -147,6 +156,40 @@ def main():
         except Exception as e:
             print(f"Warning: Could not load TransReID model: {e}")
             print("Proceeding without ReID feature extraction.")
+
+    # Initialize OpenGait components if requested
+    opengait_model = None
+    silhouette_processor = None
+    gait_gallery = None
+
+    if args.opengait_weights:
+        try:
+            print(f"Loading OpenGait model...")
+            # Use the config path from command-line arguments
+            opengait_model = OpenGaitModel(args.opengait_weights, args.opengait_config, device=args.device)
+            silhouette_processor = SilhouetteProcessor()
+            
+            # Initialize gait gallery
+            gait_gallery = GaitGallery(args.gait_gallery)
+            
+            # Print gallery statistics
+            if gait_gallery and hasattr(gait_gallery, 'gallery_stats'):
+                stats = gait_gallery.gallery_stats()
+                print(f"OpenGait model loaded successfully.")
+                print(f"Gallery statistics:")
+                print(f"  Total identities: {stats['total_identities']}")
+                print(f"  Total embeddings: {stats['total_embeddings']}")
+                if stats['embedding_dimensions']:
+                    print(f"  Embedding dimensions: {stats['embedding_dimensions']}")
+            else:
+                print(f"OpenGait model loaded successfully. No gallery statistics available.")
+        except Exception as e:
+            print(f"Warning: Could not load OpenGait model: {e}")
+            import traceback
+            traceback.print_exc()  # Print the full traceback for debugging
+            opengait_model = None
+            silhouette_processor = None
+            gait_gallery = None
 
     # Configure tracking parameters
     tracking_config = {
@@ -301,10 +344,18 @@ def main():
                                     standard_width = int(standard_height * aspect_ratio)
                                     normalized_silhouette = cv2.resize(silhouette, (standard_width, standard_height))
                                     
-                                    # Store normalized silhouette for GEI generation
+                                    # Always initialize the person_id key if it doesn't exist
                                     if person_id not in person_silhouettes:
                                         person_silhouettes[person_id] = []
+                                        
+                                    # Store normalized silhouette for GEI generation
+                                    # We always collect silhouettes to ensure we have enough for analysis
                                     person_silhouettes[person_id].append(normalized_silhouette)
+                                    
+                                    # Limit the number of stored silhouettes to prevent memory issues
+                                    # Keep only the most recent 60 frames (arbitrary limit that can be adjusted)
+                                    if len(person_silhouettes[person_id]) > 60:
+                                        person_silhouettes[person_id] = person_silhouettes[person_id][-60:]
                             else:
                                 if args.save_crops:
                                     # No mask found, save original crop
@@ -377,6 +428,36 @@ def main():
                             seg_file = segmentation_files[idx] if idx < len(segmentation_files) else ""
                             writer.writerow([frame_index, person_id, x1, y1, x2, y2, confidence, seg_file])
                         
+                        # Integrate gait analysis in the frame processing loop
+                        if args.gait_analysis and opengait_model:
+                            try:
+                                # Check if person_id exists in the dictionary and has enough silhouettes
+                                if person_id in person_silhouettes and len(person_silhouettes[person_id]) >= 10:
+                                    # Process sequence for OpenGait
+                                    sequence = silhouette_processor.prepare_sequence(person_silhouettes[person_id])
+                                    
+                                    # Extract gait embedding
+                                    gait_embedding = opengait_model.extract_embeddings(sequence)
+                                    
+                                    # Only proceed if we got valid embeddings
+                                    if gait_embedding is not None:
+                                        # In training/gallery building mode, add to gallery
+                                        if args.build_gallery:
+                                            gait_gallery.add_embedding(person_id, gait_embedding)
+                                            print(f"Added embedding for ID {person_id} to gallery")
+                                        
+                                        # In identification mode, match against gallery only if it has entries
+                                        elif gait_gallery and len(gait_gallery.gallery) > 0:
+                                            match_id, confidence = gait_gallery.find_match(gait_embedding, args.gait_threshold)
+                                            if match_id is not None:
+                                                print(f"Gait match found: Track {person_id} → Identity {match_id} (confidence: {confidence:.2f})")
+                                    else:
+                                        print(f"Warning: Could not extract embeddings for track {person_id}")
+                            except Exception as e:
+                                print(f"Error in gait analysis for track {person_id}: {e}")
+                                import traceback
+                                traceback.print_exc()
+
                         # Write frame to output video
                         video_writer.write(output_frame)
                         
@@ -407,6 +488,11 @@ def main():
                 frame_index += 1
                 pbar.update(1)
                 
+                # Save gallery periodically if we're building it (every 100 frames)
+                if args.build_gallery and gait_gallery and frame_index % 100 == 0:
+                    print(f"\nSaving gallery at frame {frame_index}...")
+                    gait_gallery.save_gallery()
+                
                 # Print tracking statistics every 100 frames
                 if frame_index % 100 == 0:
                     active_tracks = len([tid for tid, history in track_history.items() 
@@ -419,6 +505,11 @@ def main():
     if args.display:
         cv2.destroyAllWindows()
     
+    # Save gallery at the end if in building mode
+    if args.build_gallery and gait_gallery:
+        print("Saving gait embedding gallery...")
+        gait_gallery.save_gallery()
+
     # Create Gait Energy Images (GEI) for each person if gait analysis is enabled
     if args.gait_analysis and person_silhouettes:
         print("\nGenerating Gait Energy Images (GEI) for each person...")

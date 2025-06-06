@@ -4,7 +4,7 @@ from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID
 from .backbones.swin_transformer import swin_base_patch4_window7_224, swin_small_patch4_window7_224
-from metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
+from .metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 from .backbones.resnet_ibn_a import resnet50_ibn_a,resnet101_ibn_a
 
 def shuffle_unit(features, shift, group, begin=1):

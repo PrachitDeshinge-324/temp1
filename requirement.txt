@@ -1,0 +1,8 @@
+torchvision
+pyyaml
+tensorboard
+opencv-python
+tqdm
+py7zr
+kornia
+einops

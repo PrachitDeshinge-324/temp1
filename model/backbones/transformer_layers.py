@@ -2,7 +2,9 @@ import math
 import os.path as osp
 import torch
 from torch import nn as nn
-from torch._six import container_abcs
+from torch import Tensor
+from torch.nn.init import kaiming_normal_
+from collections.abc import Iterable
 from functools import partial
 from itertools import repeat
 from torch.nn import functional as F
@@ -10,7 +12,7 @@ from torch.nn import functional as F
 # From PyTorch internals
 def _ntuple(n):
     def parse(x):
-        if isinstance(x, container_abcs.Iterable):
+        if isinstance(x, Iterable):
             return x
         return tuple(repeat(x, n))
     return parse
@@ -157,7 +159,7 @@ def _init_vit_weights(m, n: str = '', head_bias: float = 0., jax_impl: bool = Fa
             nn.init.zeros_(m.weight)
             nn.init.constant_(m.bias, head_bias)
         elif n.startswith('pre_logits'):
-            lecun_normal_(m.weight)
+            kaiming_normal_(m.weight)
             nn.init.zeros_(m.bias)
         else:
             if jax_impl:
@@ -173,7 +175,7 @@ def _init_vit_weights(m, n: str = '', head_bias: float = 0., jax_impl: bool = Fa
                     nn.init.zeros_(m.bias)
     elif jax_impl and isinstance(m, nn.Conv2d):
         # NOTE conv was left to pytorch default in my original init
-        lecun_normal_(m.weight)
+        kaiming_normal_(m.weight)
         if m.bias is not None:
             nn.init.zeros_(m.bias)
     elif isinstance(m, nn.LayerNorm):
