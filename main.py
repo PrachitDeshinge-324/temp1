@@ -193,6 +193,10 @@ def get_arguments():
                         help='Number of frames to use for initial gallery building')
     parser.add_argument('--prevent_identity_conflicts', action='store_true',
                         help='Prevent multiple tracks in same frame having same identity')
+    parser.add_argument('--start_frame', type=int, default=0,
+                        help='Starting frame index (0-based) for processing')
+    parser.add_argument('--end_frame', type=int, default=-1,
+                        help='Ending frame index (0-based) for processing (-1 for end of video)')
 
     args = parser.parse_args()
     if not os.path.isfile(args.input):
@@ -201,6 +205,13 @@ def get_arguments():
         os.makedirs(args.output_dir)
     if not os.path.exists(args.weights_dir):
         raise FileNotFoundError(f"Weights folder {args.weights_dir} does not exist.")
+    
+    # Validate frame range arguments
+    if args.start_frame < 0:
+        raise ValueError("Start frame must be >= 0")
+    if args.end_frame != -1 and args.end_frame < args.start_frame:
+        raise ValueError("End frame must be >= start frame or -1 for end of video")
+    
     return args
 
 def main():
@@ -229,6 +240,26 @@ def main():
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     logger.info(f"Video stats: {frame_count} frames, {frame_width}x{frame_height}, {fps:.1f} FPS")
+    
+    # Handle frame range parameters
+    start_frame = args.start_frame
+    end_frame = args.end_frame if args.end_frame != -1 else frame_count - 1
+    
+    # Validate frame range against video length
+    if start_frame >= frame_count:
+        raise ValueError(f"Start frame {start_frame} is beyond video length ({frame_count} frames)")
+    if end_frame >= frame_count:
+        logger.warning(f"End frame {end_frame} is beyond video length, setting to {frame_count - 1}")
+        end_frame = frame_count - 1
+    
+    # Calculate actual frames to process
+    frames_to_process = end_frame - start_frame + 1
+    logger.info(f"Processing frame range: {start_frame} to {end_frame} ({frames_to_process} frames)")
+    
+    # Seek to start frame if not starting from beginning
+    if start_frame > 0:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        logger.info(f"Seeking to frame {start_frame}")
 
     # Always initialize video writer to save output video
     output_video_path = os.path.join(output_dir, "output_with_detections.mp4")
@@ -366,16 +397,20 @@ def main():
         headers = ['frame', 'person_id', 'x1', 'y1', 'x2', 'y2', 'confidence', 'seg_file']
         writer.writerow(headers)
 
-        frame_index = 0
+        frame_index = start_frame
         paused = False
         
         # Create track history for visualization
         track_history = {}
         
-        with tqdm(total=frame_count, desc="Processing frames") as pbar:
+        with tqdm(total=frames_to_process, desc="Processing frames") as pbar:
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret:
+                    break
+                
+                # Check if we've reached the end frame
+                if frame_index > end_frame:
                     break
                 
                 # Run YOLO tracking (built-in ByteTrack)
@@ -919,7 +954,7 @@ def main():
                                             if frame_index - frame_idx <= periodic_update_interval)
                 logger.info(f"Recent complete updates (last {periodic_update_interval} frames): {recent_complete_updates}")
     
-    logger.info(f"Video processing completed. Results saved to {csv_path}")
+    logger.info(f"Video processing completed. Processed frames {start_frame} to {frame_index - 1} ({frame_index - start_frame} frames total). Results saved to {csv_path}")
     return 0
 
 if __name__ == "__main__":

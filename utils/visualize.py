@@ -6,10 +6,11 @@ def generate_colors(num_colors):
     """Generate a list of distinct colors for person IDs"""
     colors = []
     for i in range(num_colors):
-        # Generate distinct colors using HSV color space
-        hue = (i * 137.508) % 360  # Golden angle approximation for good distribution
-        color = cv2.cvtColor(np.uint8([[[hue, 255, 255]]]), cv2.COLOR_HSV2BGR)[0][0]
-        colors.append((int(color[0]), int(color[1]), int(color[2])))
+        hue = (i * 137.508) % 360  # Golden angle
+        hsv_hue = int(hue * 0.5)   # Scale to OpenCV hue range [0, 179]
+        hsv_color = np.array([[[hsv_hue, 255, 255]]], dtype=np.uint8)
+        bgr_color = cv2.cvtColor(hsv_color, cv2.COLOR_HSV2BGR)[0][0]
+        colors.append((int(bgr_color[0]), int(bgr_color[1]), int(bgr_color[2])))
     return colors
 
 def draw_person_detection(frame, bbox, person_id, color=(0, 255, 0), thickness=2, identity_id=None):

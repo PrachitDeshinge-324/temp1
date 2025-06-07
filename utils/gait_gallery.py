@@ -13,6 +13,10 @@ class GaitGallery:
         self.next_id = 1  # For assigning new unique IDs to unmatched people
         self.track_to_identity = {}  # Initialize the mapping attribute
         
+        # Frame-level ID management to prevent duplicates within single frames
+        self.current_frame_index = -1
+        self.frame_assigned_ids = set()  # Track which IDs have been assigned in current frame
+        
         if gallery_path and os.path.exists(gallery_path):
             self.load_gallery(gallery_path)
             # Set next_id to be one more than the highest ID in the gallery
@@ -23,6 +27,14 @@ class GaitGallery:
                         self.next_id = max(numeric_ids) + 1
                 except:
                     pass  # Keep default if something goes wrong
+    
+    def reset_frame_tracking(self, frame_index):
+        """Reset frame-level tracking for new frame to prevent duplicate IDs"""
+        if frame_index != self.current_frame_index:
+            if self.frame_assigned_ids:
+                print(f"Frame {self.current_frame_index}: Assigned IDs {sorted(list(self.frame_assigned_ids))}")
+            self.current_frame_index = frame_index
+            self.frame_assigned_ids.clear()
     
     def get_or_assign_identity(self, query_embedding, threshold=0.98, force_new=False, frame_index=0):
         """
@@ -37,26 +49,31 @@ class GaitGallery:
         Returns:
             tuple: (person_id, confidence, is_new_identity)
         """
+        # Reset frame tracking if this is a new frame
+        self.reset_frame_tracking(frame_index)
+        
         # Always assign new identities during gallery building phase or if forced
         if force_new:
             new_id = str(self.next_id)
             self.next_id += 1
             self.gallery[new_id] = [query_embedding]  # Store as a list with one embedding
+            self.frame_assigned_ids.add(new_id)
             return new_id, 0.0, True
             
-        # Find match in existing gallery
-        match_id, confidence = self.find_match(query_embedding, threshold)
+        # Find match in existing gallery, but exclude IDs already assigned this frame
+        match_id, confidence = self.find_match(query_embedding, threshold, exclude_ids=self.frame_assigned_ids)
         
         if match_id is not None:
-            # Don't add multiple embeddings, just replace the existing one
-            # This ensures one embedding per identity
+            # Update the embedding for this identity with the new one (replace, don't accumulate)
             self.gallery[match_id] = [query_embedding]  # Replace with latest
+            self.frame_assigned_ids.add(match_id)
             return match_id, confidence, False
         else:
             # No match found, assign new identity
             new_id = str(self.next_id)
             self.next_id += 1
             self.gallery[new_id] = [query_embedding]  # Store as a list with one embedding
+            self.frame_assigned_ids.add(new_id)
             return new_id, 0.0, True
 
     def update_embedding(self, identity_id, new_embedding, weight=0.3):
@@ -159,7 +176,7 @@ class GaitGallery:
             traceback.print_exc()
             return None
     
-    def find_match(self, query_embedding, threshold=0.6):
+    def find_match(self, query_embedding, threshold=0.6, exclude_ids=None):
         """Find matching person ID for a query embedding"""
         try:
             # Validate query embedding
@@ -172,10 +189,16 @@ class GaitGallery:
                 print("Warning: Gallery is empty, cannot find matches")
                 return None, 0.0
                 
+            if exclude_ids is None:
+                exclude_ids = set()
+                
             best_score = -1
             best_match = None
             
             for person_id in self.gallery:
+                # Skip IDs that are already assigned in this frame
+                if person_id in exclude_ids:
+                    continue
                 # Get reference embedding for this person
                 ref_embedding = self.get_aggregated_embedding(person_id)
                 if ref_embedding is None:
