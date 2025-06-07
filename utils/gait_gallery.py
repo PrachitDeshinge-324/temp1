@@ -3,6 +3,7 @@ import os
 import pickle
 import numpy as np
 import torch
+import torch.nn.functional as F
 from sklearn.preprocessing import normalize
 
 class GaitGallery:
@@ -151,15 +152,19 @@ class GaitGallery:
             
             # Check if we have valid embeddings
             valid_embeddings = [emb for emb in self.gallery[person_id] 
-                              if emb is not None and isinstance(emb, torch.Tensor) and emb.numel() > 0]
+                            if emb is not None and isinstance(emb, torch.Tensor) and emb.numel() > 0]
             
             if not valid_embeddings:
                 print(f"Warning: No valid embeddings found for person {person_id}")
                 return None
                 
-            # Average pooling of all embeddings
+            # Stack embeddings and compute quality scores (L2 norm as confidence)
             embeddings = torch.stack(valid_embeddings)
-            aggregated = torch.mean(embeddings, dim=0)
+            quality_scores = torch.norm(embeddings, dim=1)
+            weights = F.softmax(quality_scores, dim=0)
+            
+            # Weighted aggregation
+            aggregated = torch.sum(embeddings * weights.unsqueeze(1), dim=0)
             
             # Normalize
             norm = aggregated.norm()
@@ -172,8 +177,6 @@ class GaitGallery:
             return aggregated
         except Exception as e:
             print(f"Error getting aggregated embedding for person {person_id}: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     
     def find_match(self, query_embedding, threshold=0.6, exclude_ids=None):

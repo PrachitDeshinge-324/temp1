@@ -181,14 +181,16 @@ def get_arguments():
     parser.add_argument('--reid_similarity', type=float, default=0.7, help='Similarity threshold for ReID (0.0-1.0)')
     parser.add_argument('--opengait_weights', type=str, default="", help='Path to OpenGait model weights')
     parser.add_argument('--opengait_config', type=str, default="OpenGait/configs/default.yaml", help='Path to OpenGait model configuration')
-    parser.add_argument('--gait_gallery', type=str, default="gait_gallery.pkl", help='Path to gait embedding gallery')
+    parser.add_argument('--build_gallery', action='store_true', 
+                        help='Update gallery mode: Load existing gallery and update with new embeddings. Creates new gallery if none exists.')
+    parser.add_argument('--clear_gallery', action='store_true',
+                        help='Clear gallery mode: Delete existing gallery and start fresh with new embeddings.')
+    parser.add_argument('--gait_gallery', type=str, default="gait_gallery.pkl", 
+                        help='Path to gait embedding gallery file. Three modes: 1) --clear_gallery: Start fresh, 2) --build_gallery: Update existing, 3) Neither flag: Inference-only mode (read-only)')
     parser.add_argument('--gait_threshold', type=float, default=0.98, help='Threshold for gait matching (0.0-1.0)')
-    parser.add_argument('--build_gallery', action='store_true', help='Build or update the gait embedding gallery')
     parser.add_argument('--save_silhouettes', action='store_true', help='Save silhouette images during gait analysis')
     parser.add_argument('--force_new_identities', action='store_true',
                         help='Force creation of new identities even with matches')
-    parser.add_argument('--clear_gallery', action='store_true',
-                        help='Clear existing gallery and start fresh')
     parser.add_argument('--gallery_build_frames', type=int, default=200,
                         help='Number of frames to use for initial gallery building')
     parser.add_argument('--prevent_identity_conflicts', action='store_true',
@@ -212,6 +214,10 @@ def get_arguments():
     if args.end_frame != -1 and args.end_frame < args.start_frame:
         raise ValueError("End frame must be >= start frame or -1 for end of video")
     
+    # Validate gallery mode arguments
+    if args.clear_gallery and args.build_gallery:
+        raise ValueError("Cannot use both --clear_gallery and --build_gallery flags simultaneously. Choose one mode.")
+    
     return args
 
 def main():
@@ -220,12 +226,22 @@ def main():
     
     args = get_arguments()
     
+    # Log gallery mode
+    if args.clear_gallery:
+        logger.info("🔄 GALLERY MODE: Clear gallery - Starting with empty gallery")
+    elif args.build_gallery:
+        logger.info("📈 GALLERY MODE: Update gallery - Loading existing gallery for updates")  
+    else:
+        logger.info("🔍 GALLERY MODE: Inference only - Using existing gallery in read-only mode")
+    
     # Log input parameters
     logger.info(f"Input file: {args.input}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Weights directory: {args.weights_dir}")
     if args.opengait_weights:
         logger.info(f"OpenGait weights: {args.opengait_weights}")
+        logger.info(f"Gallery file: {args.gait_gallery}")
+        logger.info(f"Gait threshold: {args.gait_threshold}")
     
     video_path = args.input
     output_dir = args.output_dir
@@ -333,14 +349,35 @@ def main():
             opengait_model = OpenGaitModel(args.opengait_weights, args.opengait_config, device=args.device)
             silhouette_processor = SilhouetteProcessor()
             
-            # Initialize gait gallery
-            gait_gallery = GaitGallery(args.gait_gallery)
-            
-            # Clear gallery if requested
-            if args.clear_gallery and gait_gallery:
-                logger.info("Clearing existing gallery")
+            # Initialize gait gallery with proper scenario handling
+            if args.clear_gallery:
+                logger.info("Clear gallery mode: Starting with empty gallery")
+                # Delete existing gallery file if it exists
+                if os.path.exists(args.gait_gallery):
+                    os.remove(args.gait_gallery)
+                    logger.info(f"Deleted existing gallery file: {args.gait_gallery}")
+                # Create new empty gallery
+                gait_gallery = GaitGallery(args.gait_gallery)
                 gait_gallery.gallery = {}
                 gait_gallery.next_id = 1
+            elif args.build_gallery:
+                logger.info("Update gallery mode: Loading existing gallery for updates")
+                # Load existing gallery or create new if doesn't exist
+                gait_gallery = GaitGallery(args.gait_gallery)
+                if os.path.exists(args.gait_gallery):
+                    logger.info(f"Loaded existing gallery with {len(gait_gallery.gallery)} identities")
+                else:
+                    logger.info("No existing gallery found, creating new one")
+            else:
+                logger.info("Inference only mode: Loading existing gallery in read-only mode")
+                # Check if gallery exists for inference
+                if not os.path.exists(args.gait_gallery):
+                    logger.error(f"Gallery file {args.gait_gallery} not found for inference mode!")
+                    logger.error("Please run with --build_gallery first to create a gallery, or use --clear_gallery to start fresh")
+                    gait_gallery = None
+                else:
+                    gait_gallery = GaitGallery(args.gait_gallery)
+                    logger.info(f"Loaded gallery with {len(gait_gallery.gallery)} identities for inference")
             
             # Print gallery statistics
             if gait_gallery and hasattr(gait_gallery, 'gallery_stats'):
@@ -741,29 +778,46 @@ def main():
                                                     if person_id in gait_gallery.track_to_identity:
                                                         identity_id = gait_gallery.track_to_identity[person_id] 
                                                         
-                                                        # Only update if we have a complete dataset or significant improvement
-                                                        if (current_quality["is_complete"] or 
-                                                            update_reason in ["superior_complete_dataset", "periodic_quality_improvement"]):
+                                                        # Only update if we're in gallery building mode and have complete dataset
+                                                        if ((args.clear_gallery or args.build_gallery) and 
+                                                            (current_quality["is_complete"] or 
+                                                             update_reason in ["superior_complete_dataset", "periodic_quality_improvement"])):
                                                             # Use higher weight for complete datasets
                                                             update_weight = 0.5 if current_quality["is_complete"] else 0.3
                                                             update_success = gait_gallery.update_embedding(identity_id, gait_embedding, weight=update_weight)
                                                             if update_success:
                                                                 logger.info(f"Updated Track {person_id} → Identity {identity_id} (weight: {update_weight})")
-                                                    else:
-                                                        # New track - match or assign identity (single database write)
-                                                        identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
-                                                            gait_embedding,
-                                                            threshold=args.gait_threshold,
-                                                            force_new=args.clear_gallery or (frame_index < 200)
-                                                        )
-                                                        
-                                                        if is_new:
-                                                            logger.info(f"New identity: Track {person_id} → Identity {identity_id}")
                                                         else:
-                                                            logger.info(f"Match found: Track {person_id} → Identity {identity_id} (conf: {confidence:.2f})")
-                                                        
-                                                        # Map track ID to identity ID (single mapping write)
-                                                        gait_gallery.track_to_identity[person_id] = identity_id
+                                                            # In inference-only mode, just use the existing identity without updating
+                                                            if not (args.clear_gallery or args.build_gallery):
+                                                                logger.info(f"Inference mode: Track {person_id} → Existing Identity {identity_id}")
+                                                    else:
+                                                        # New track - behavior depends on mode
+                                                        if args.clear_gallery or args.build_gallery:
+                                                            # Building mode: match or assign identity (single database write)
+                                                            identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
+                                                                gait_embedding,
+                                                                threshold=args.gait_threshold,
+                                                                force_new=args.clear_gallery or (frame_index < 200)
+                                                            )
+                                                            
+                                                            if is_new:
+                                                                logger.info(f"New identity: Track {person_id} → Identity {identity_id}")
+                                                            else:
+                                                                logger.info(f"Match found: Track {person_id} → Identity {identity_id} (conf: {confidence:.2f})")
+                                                            
+                                                            # Map track ID to identity ID (single mapping write)
+                                                            gait_gallery.track_to_identity[person_id] = identity_id
+                                                        else:
+                                                            # Inference-only mode: only match against existing gallery, don't create new identities
+                                                            match_id, confidence = gait_gallery.find_match(gait_embedding, threshold=args.gait_threshold)
+                                                            if match_id is not None:
+                                                                logger.info(f"Inference match: Track {person_id} → Identity {match_id} (conf: {confidence:.2f})")
+                                                                gait_gallery.track_to_identity[person_id] = match_id
+                                                            else:
+                                                                logger.info(f"Inference mode: No match found for Track {person_id} (unknown person)")
+                                                                # Assign a temporary ID that won't be saved
+                                                                gait_gallery.track_to_identity[person_id] = f"unknown_{person_id}"
                                                 
                                                 # Clear processed frames from buffer to save memory (keep overlap for complete datasets)
                                                 if process_reason == "batch_update":
@@ -826,7 +880,8 @@ def main():
                 pbar.update(1)
                 
                 # Save gallery periodically if we're building it (every 100 frames)
-                if args.build_gallery and gait_gallery and frame_index % 100 == 0:
+                # Only save during clear_gallery or build_gallery modes, not inference-only
+                if (args.clear_gallery or args.build_gallery) and gait_gallery and frame_index % 100 == 0:
                     gait_gallery.save_gallery()
                 
                 # Print tracking statistics every 100 frames
@@ -841,10 +896,12 @@ def main():
     if args.display:
         cv2.destroyAllWindows()
     
-    # Save gallery at the end if in building mode
-    if args.build_gallery and gait_gallery:
+    # Save gallery at the end if in building mode (clear_gallery or build_gallery)
+    if (args.clear_gallery or args.build_gallery) and gait_gallery:
         logger.info("Saving gait embedding gallery...")
         gait_gallery.save_gallery()
+    elif gait_gallery:
+        logger.info("Inference-only mode: Gallery was not modified")
 
     # Create Gait Energy Images (GEI) for each person if gait analysis is enabled
     if args.gait_analysis and track_frame_buffer:

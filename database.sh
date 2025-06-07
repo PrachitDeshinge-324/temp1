@@ -12,9 +12,14 @@ python main.py \
     --weights_dir '../Fresh/weights' \
     --transreid_weights '../Fresh/weights/transreid_vitbase.pth' \
     --display \
+    --gait_analysis \
     --opengait_config "OpenGait/configs/deepgaitv2/DeepGaitV2_sustech1k.yaml"\
     --opengait_weights 'DeepGaitV2_30_DA-50000.pt' \
-    --start_frame 600
+    --gait_threshold 0.99 \
+    --prevent_identity_conflicts \
+    --clear_gallery \
+    --start_frame 100 \
+    --end_frame 400
 
 find . -type d -name "__pycache__" -exec rm -rf {} +
 find . -type d -name ".cache" -exec rm -rf {} +
