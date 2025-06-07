@@ -4,6 +4,8 @@ import cv2
 import csv
 import numpy as np
 import torch
+import logging
+import traceback
 from tqdm import tqdm
 from ultralytics import YOLO
 from utils.helper import get_best_device
@@ -13,6 +15,31 @@ from utils.reid_tracker import ReIDEnhancedTracker
 from utils.opengait_model import OpenGaitModel
 from utils.silhouette_processor import SilhouetteProcessor
 from utils.gait_gallery import GaitGallery
+
+# Configure logging to show only necessary information
+def setup_logging():
+    """Configure logging for the application with minimal terminal output."""
+    # Set up main logger
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%H:%M:%S'
+    )
+    
+    # Suppress verbose logging from third-party libraries
+    logging.getLogger('ultralytics').setLevel(logging.WARNING)
+    logging.getLogger('torch').setLevel(logging.WARNING)
+    logging.getLogger('torchvision').setLevel(logging.WARNING)
+    logging.getLogger('PIL').setLevel(logging.WARNING)
+    logging.getLogger('matplotlib').setLevel(logging.WARNING)
+    
+    # Suppress OpenGait internal logging
+    logging.getLogger('opengait').setLevel(logging.WARNING)
+    
+    # Create application logger
+    logger = logging.getLogger('gait_analysis')
+    logger.setLevel(logging.INFO)
+    return logger
 
 def assess_silhouette_quality(silhouettes):
     """
@@ -174,33 +201,39 @@ def get_arguments():
         os.makedirs(args.output_dir)
     if not os.path.exists(args.weights_dir):
         raise FileNotFoundError(f"Weights folder {args.weights_dir} does not exist.")
-    print(f"Input file: {args.input}")
-    print(f"Output file: {args.output_dir}")
-    print(f"Weights folder: {args.weights_dir}")
     return args
 
 def main():
+    # Setup logging first
+    logger = setup_logging()
+    
     args = get_arguments()
+    
+    # Log input parameters
+    logger.info(f"Input file: {args.input}")
+    logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Weights directory: {args.weights_dir}")
+    if args.opengait_weights:
+        logger.info(f"OpenGait weights: {args.opengait_weights}")
+    
     video_path = args.input
     output_dir = args.output_dir
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video file {video_path}")
-    print(f"Processing video: {video_path}")
+    
+    logger.info(f"Processing video: {video_path}")
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Total frames in video: {frame_count}")
-    print(f"Video resolution: {frame_width}x{frame_height}")
-    print(f"Video FPS: {fps}")
+    logger.info(f"Video stats: {frame_count} frames, {frame_width}x{frame_height}, {fps:.1f} FPS")
 
     # Always initialize video writer to save output video
     output_video_path = os.path.join(output_dir, "output_with_detections.mp4")
     video_writer = create_video_writer(output_video_path, fps, frame_width, frame_height)
-    print(f"Output video will be saved to: {output_video_path}")
-    print("Annotations will be displayed on the output video")
+    logger.info(f"Output video: {output_video_path}")
     
     # Create directory for segmented crops and silhouettes
     seg_crops_dir = os.path.join(output_dir, "segmented_crops")
@@ -209,17 +242,17 @@ def main():
     
     if args.save_crops and not os.path.exists(seg_crops_dir):
         os.makedirs(seg_crops_dir)
-        print(f"Segmented crops will be saved to: {seg_crops_dir}")
+        logger.info(f"Segmented crops will be saved to: {seg_crops_dir}")
     
     if args.gait_analysis:
         if not os.path.exists(silhouette_dir):
             os.makedirs(silhouette_dir)
         if not os.path.exists(gait_dir):
             os.makedirs(gait_dir)
-        print(f"Gait analysis data will be saved to: {gait_dir}")
+        logger.info(f"Gait analysis data will be saved to: {gait_dir}")
     
     if args.display:
-        print("Real-time display enabled - press 'q' to quit, 'p' to pause/resume")
+        logger.info("Real-time display enabled - press 'q' to quit, 'p' to pause/resume")
         cv2.namedWindow('Person Detection & Tracking', cv2.WINDOW_NORMAL)
         cv2.resizeWindow('Person Detection & Tracking', 960, 540)  # Resize for better viewing
 
@@ -227,10 +260,10 @@ def main():
     person_colors = generate_colors(50)  # Generate 50 distinct colors
 
     # Initialize YOLO models for detection and segmentation
-    print(f"Loading YOLOv8 models...")
+    logger.info("Loading YOLO models...")
     person_detector = YOLO(os.path.join(args.weights_dir, "yolo11x.pt"))  # For person detection
     segmentation_model = YOLO(os.path.join(args.weights_dir, "yolo11x-seg.pt"))  # For person segmentation
-    print("YOLOv8 models loaded successfully.")
+    logger.info("YOLO models loaded successfully")
     
     # Initialize TransReID model for feature extraction (optional)
     transreid_model = None
@@ -239,24 +272,23 @@ def main():
     
     if args.transreid_weights:
         try:
-            print(f"Loading TransReID model...")
+            logger.info("Loading TransReID model...")
             transreid_model = TransReIDModel(args.transreid_weights, device=args.device)
-            print("TransReID model loaded successfully for feature extraction.")
+            logger.info("TransReID model loaded successfully")
             use_reid_features = True
             
             # Initialize ReID tracker with TransReID model
-            print("Initializing ReID-enhanced tracker...")
             reid_tracker = ReIDEnhancedTracker(
                 transreid_model=transreid_model,
                 similarity_threshold=args.reid_similarity,
                 feature_history_size=10,
                 reid_memory_frames=30
             )
-            print(f"ReID-enhanced tracker initialized with similarity threshold: {args.reid_similarity}")
+            logger.info(f"ReID tracker initialized (threshold: {args.reid_similarity})")
             
         except Exception as e:
-            print(f"Warning: Could not load TransReID model: {e}")
-            print("Proceeding without ReID feature extraction.")
+            logger.warning(f"Could not load TransReID model: {e}")
+            logger.info("Proceeding without ReID feature extraction")
 
     # Initialize OpenGait components if requested
     opengait_model = None
@@ -265,7 +297,7 @@ def main():
 
     if args.opengait_weights:
         try:
-            print(f"Loading OpenGait model...")
+            logger.info("Loading OpenGait model...")
             # Use the config path from command-line arguments
             opengait_model = OpenGaitModel(args.opengait_weights, args.opengait_config, device=args.device)
             silhouette_processor = SilhouetteProcessor()
@@ -275,24 +307,22 @@ def main():
             
             # Clear gallery if requested
             if args.clear_gallery and gait_gallery:
-                print("Clearing existing gallery as requested...")
+                logger.info("Clearing existing gallery")
                 gait_gallery.gallery = {}
                 gait_gallery.next_id = 1
+            
             # Print gallery statistics
             if gait_gallery and hasattr(gait_gallery, 'gallery_stats'):
                 stats = gait_gallery.gallery_stats()
-                print(f"OpenGait model loaded successfully.")
-                print(f"Gallery statistics:")
-                print(f"  Total identities: {stats['total_identities']}")
-                print(f"  Total embeddings: {stats['total_embeddings']}")
+                logger.info(f"Gallery stats: {stats['total_identities']} identities, {stats['total_embeddings']} embeddings")
                 if stats['embedding_dimensions']:
-                    print(f"  Embedding dimensions: {stats['embedding_dimensions']}")
+                    logger.info(f"Embedding dimensions: {stats['embedding_dimensions']}")
             else:
-                print(f"OpenGait model loaded successfully. No gallery statistics available.")
+                logger.info("OpenGait model loaded successfully")
         except Exception as e:
-            print(f"Warning: Could not load OpenGait model: {e}")
+            logger.error(f"Could not load OpenGait model: {e}")
             import traceback
-            traceback.print_exc()  # Print the full traceback for debugging
+            traceback.print_exc()  # Keep detailed error for debugging
             opengait_model = None
             silhouette_processor = None
             gait_gallery = None
@@ -307,9 +337,7 @@ def main():
         'match_thresh': args.iou_thresh  # IOU matching threshold
     }
     
-    print(f"Using ByteTrack with configuration:")
-    for key, value in tracking_config.items():
-        print(f"  {key}: {value}")
+    logger.info(f"ByteTrack config: conf={args.track_conf}, iou={args.iou_thresh}")
     
     # Store silhouettes for gait analysis
     person_silhouettes = {}
@@ -645,9 +673,7 @@ def main():
                                                 update_reason = "periodic_quality_improvement"
                                         
                                         if should_update_embedding:
-                                            print(f"  → Quality Assessment: {update_reason}")
-                                            print(f"  → Completeness: {current_quality['completeness']:.3f}, Coverage: {current_quality['coverage']:.3f}")
-                                            print(f"  → Is Complete: {current_quality['is_complete']}, Valid Frames: {current_quality['valid_frames']}/{current_quality['frame_count']}")
+                                            logger.info(f"Track {person_id}: {update_reason} (completeness: {current_quality['completeness']:.3f}, frames: {buffer_size})")
                                             
                                             # Prepare sequence for OpenGait (use all buffered frames)
                                             sequence = silhouette_processor.prepare_sequence(track_frame_buffer[person_id])
@@ -687,7 +713,7 @@ def main():
                                                             update_weight = 0.5 if current_quality["is_complete"] else 0.3
                                                             update_success = gait_gallery.update_embedding(identity_id, gait_embedding, weight=update_weight)
                                                             if update_success:
-                                                                print(f"  → Updated embedding for Track {person_id} → Identity {identity_id} (weight: {update_weight})")
+                                                                logger.info(f"Updated Track {person_id} → Identity {identity_id} (weight: {update_weight})")
                                                     else:
                                                         # New track - match or assign identity (single database write)
                                                         identity_id, confidence, is_new = gait_gallery.get_or_assign_identity(
@@ -697,9 +723,9 @@ def main():
                                                         )
                                                         
                                                         if is_new:
-                                                            print(f"  → New identity created: Track {person_id} → Identity {identity_id}")
+                                                            logger.info(f"New identity: Track {person_id} → Identity {identity_id}")
                                                         else:
-                                                            print(f"  → Gait match found: Track {person_id} → Identity {identity_id} (confidence: {confidence:.2f})")
+                                                            logger.info(f"Match found: Track {person_id} → Identity {identity_id} (conf: {confidence:.2f})")
                                                         
                                                         # Map track ID to identity ID (single mapping write)
                                                         gait_gallery.track_to_identity[person_id] = identity_id
@@ -711,10 +737,10 @@ def main():
                                                                      len(track_frame_buffer[person_id]) // 4)
                                                     track_frame_buffer[person_id] = track_frame_buffer[person_id][-overlap_size:] if overlap_size > 0 else []
                                             else:
-                                                print(f"  → Warning: Failed to extract embedding for Track {person_id}")
+                                                logger.warning(f"Failed to extract embedding for Track {person_id}")
                                         else:
-                                            print(f"  → Quality insufficient for update: completeness={current_quality['completeness']:.3f}, is_complete={current_quality['is_complete']}")
-                                            print(f"  → Reason: {current_quality['completeness']:.3f} vs best {track_silhouette_quality[person_id]['best_quality']['completeness']:.3f}")
+                                            # Skip update but log reason for debugging
+                                            pass  # Removed verbose logging here
                                 
                                 # Clear silhouettes for next frame to avoid duplication
                                 person_silhouettes.clear()
@@ -722,20 +748,18 @@ def main():
                                 # Periodic gallery save (reduce I/O frequency)
                                 if frame_index % 200 == 0 and gait_gallery:
                                     gait_gallery.save_gallery()
-                                    print(f"Gallery saved at frame {frame_index}")
+                                    logger.info(f"Gallery saved at frame {frame_index}")
                                 
                                 # Periodic quality monitoring (every 300 frames)
                                 if frame_index % periodic_update_interval == 0:
-                                    print(f"\n=== Periodic Quality Assessment at Frame {frame_index} ===")
+                                    logger.info(f"Quality assessment at frame {frame_index}")
                                     for person_id in track_frame_buffer:
                                         if len(track_frame_buffer[person_id]) >= 20:  # Only assess if enough frames
                                             current_quality = assess_silhouette_quality(track_frame_buffer[person_id])
-                                            print(f"  Track {person_id}: {len(track_frame_buffer[person_id])} frames, "
-                                                  f"completeness={current_quality['completeness']:.3f}, "
-                                                  f"complete={current_quality['is_complete']}")
+                                            logger.info(f"  Track {person_id}: {len(track_frame_buffer[person_id])} frames, completeness={current_quality['completeness']:.3f}")
                                     
                             except Exception as e:
-                                print(f"Error in optimized gait analysis: {e}")
+                                logger.error(f"Error in gait analysis: {e}")
                                 import traceback
                                 traceback.print_exc()
                         
@@ -768,14 +792,13 @@ def main():
                 
                 # Save gallery periodically if we're building it (every 100 frames)
                 if args.build_gallery and gait_gallery and frame_index % 100 == 0:
-                    print(f"\nSaving gallery at frame {frame_index}...")
                     gait_gallery.save_gallery()
                 
                 # Print tracking statistics every 100 frames
                 if frame_index % 100 == 0:
                     active_tracks = len([tid for tid, history in track_history.items() 
                                         if len(history) > 0 and frame_index - 30 <= max(p[0] for p in history)])
-                    print(f"\nFrame {frame_index}: {active_tracks} active tracks, {len(track_history)} total tracks")
+                    logger.info(f"Frame {frame_index}: {active_tracks} active tracks, {len(track_history)} total tracks")
 
     cap.release()
     video_writer.release()
@@ -785,17 +808,17 @@ def main():
     
     # Save gallery at the end if in building mode
     if args.build_gallery and gait_gallery:
-        print("Saving gait embedding gallery...")
+        logger.info("Saving gait embedding gallery...")
         gait_gallery.save_gallery()
 
     # Create Gait Energy Images (GEI) for each person if gait analysis is enabled
     if args.gait_analysis and track_frame_buffer:
-        print("\nGenerating Gait Energy Images (GEI) for each person...")
+        logger.info("Generating Gait Energy Images (GEI) for each person...")
         for person_id, silhouettes in track_frame_buffer.items():
             if len(silhouettes) >= 10:  # Only create GEI if we have enough frames
                 gei_path = os.path.join(gait_dir, f"gei_person_{person_id:03d}.png")
                 create_gait_energy_image(silhouettes, gei_path)
-                print(f"  Created GEI for Person {person_id} using {len(silhouettes)} frames")
+                logger.info(f"  Created GEI for Person {person_id} using {len(silhouettes)} frames")
                 
                 # Generate gait cycle visualization
                 cycle_frames = min(len(silhouettes), 16)  # Use up to 16 frames for visualization
@@ -829,35 +852,35 @@ def main():
                 cycle_path = os.path.join(gait_dir, f"gait_cycle_person_{person_id:03d}.png")
                 cv2.imwrite(cycle_path, grid_img)
         
-        print(f"Gait analysis data saved to: {gait_dir}")
+        logger.info(f"Gait analysis data saved to: {gait_dir}")
     
-    print(f"Output video saved to: {output_video_path}")
+    logger.info(f"Output video saved to: {output_video_path}")
     if args.save_crops:
-        print(f"Segmented person crops saved to: {seg_crops_dir}")
+        logger.info(f"Segmented person crops saved to: {seg_crops_dir}")
     
-    print(f"\n=== Final Tracking Statistics ===")
-    print(f"Total unique persons detected: {len(track_history)}")
+    logger.info("=== Final Tracking Statistics ===")
+    logger.info(f"Total unique persons detected: {len(track_history)}")
     
     # Print optimized embedding statistics
     if args.gait_analysis and opengait_model:
-        print(f"\n=== Optimized Embedding Management Statistics ===")
-        print(f"Tracks with embeddings generated: {len(track_embeddings)}")
+        logger.info("=== Optimized Embedding Management Statistics ===")
+        logger.info(f"Tracks with embeddings generated: {len(track_embeddings)}")
         total_processing_runs = sum(track_processed_count.values()) if track_processed_count else 0
-        print(f"Total embedding processing runs: {total_processing_runs}")
+        logger.info(f"Total embedding processing runs: {total_processing_runs}")
         if track_processed_count:
             avg_processing = total_processing_runs / len(track_processed_count)
-            print(f"Average processing runs per track: {avg_processing:.1f}")
+            logger.info(f"Average processing runs per track: {avg_processing:.1f}")
         
         # Show buffer statistics
         total_buffered_frames = sum(len(buffer) for buffer in track_frame_buffer.values())
-        print(f"Total frames buffered: {total_buffered_frames}")
+        logger.info(f"Total frames buffered: {total_buffered_frames}")
         if track_frame_buffer:
             avg_buffer_size = total_buffered_frames / len(track_frame_buffer)
-            print(f"Average buffer size per track: {avg_buffer_size:.1f} frames")
+            logger.info(f"Average buffer size per track: {avg_buffer_size:.1f} frames")
         
         # Enhanced quality and completeness statistics
         if track_silhouette_quality:
-            print(f"\n=== Dataset Quality Assessment Results ===")
+            logger.info("=== Dataset Quality Assessment Results ===")
             complete_datasets = 0
             total_completeness = 0
             total_coverage = 0
@@ -873,30 +896,30 @@ def main():
                 total_coverage += best_quality["coverage"]
                 
                 # Report quality for each track
-                print(f"  Track {person_id}: Completeness={best_quality['completeness']:.3f}, "
+                logger.info(f"  Track {person_id}: Completeness={best_quality['completeness']:.3f}, "
                       f"Coverage={best_quality['coverage']:.3f}, Complete={best_quality['is_complete']}")
             
-            print(f"Tracks with complete datasets: {complete_datasets}/{len(track_silhouette_quality)}")
+            logger.info(f"Tracks with complete datasets: {complete_datasets}/{len(track_silhouette_quality)}")
             if track_silhouette_quality:
                 avg_completeness = total_completeness / len(track_silhouette_quality)
                 avg_coverage = total_coverage / len(track_silhouette_quality)
-                print(f"Average dataset completeness: {avg_completeness:.3f}")
-                print(f"Average silhouette coverage: {avg_coverage:.3f}")
+                logger.info(f"Average dataset completeness: {avg_completeness:.3f}")
+                logger.info(f"Average silhouette coverage: {avg_coverage:.3f}")
         
         # Show database efficiency
         if gait_gallery and hasattr(gait_gallery, 'track_to_identity'):
-            print(f"\n=== Gallery Update Statistics ===")
-            print(f"Gallery identities created: {len(set(gait_gallery.track_to_identity.values()))}")
-            print(f"Track-to-identity mappings: {len(gait_gallery.track_to_identity)}")
+            logger.info("=== Gallery Update Statistics ===")
+            logger.info(f"Gallery identities created: {len(set(gait_gallery.track_to_identity.values()))}")
+            logger.info(f"Track-to-identity mappings: {len(gait_gallery.track_to_identity)}")
             
             # Show periodic update statistics
             if track_last_complete_batch:
-                print(f"Tracks with complete batch updates: {len(track_last_complete_batch)}")
+                logger.info(f"Tracks with complete batch updates: {len(track_last_complete_batch)}")
                 recent_complete_updates = sum(1 for frame_idx in track_last_complete_batch.values() 
                                             if frame_index - frame_idx <= periodic_update_interval)
-                print(f"Recent complete updates (last {periodic_update_interval} frames): {recent_complete_updates}")
+                logger.info(f"Recent complete updates (last {periodic_update_interval} frames): {recent_complete_updates}")
     
-    print(f"Video processing completed. Results saved to {csv_path}")
+    logger.info(f"Video processing completed. Results saved to {csv_path}")
     return 0
 
 if __name__ == "__main__":
